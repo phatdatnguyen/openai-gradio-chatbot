@@ -1,0 +1,3 @@
+gradio
+openai
+PyPDF2

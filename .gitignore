@@ -1,0 +1,6 @@
+__pycache__/
+.vs/
+.gradio/
+.vs/
+history/
+api_key.py
