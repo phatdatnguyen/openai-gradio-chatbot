@@ -269,6 +269,6 @@ with gr.Blocks() as demo:
     save_button.click(save_history, [state, history_file_name], save_status)
     load_button.click(load_history, saved_history_file, [state, chatbot, load_status])
 
-demo.launch()
+demo.launch(max_file_size=5*gr.FileSize.MB)
 
 
