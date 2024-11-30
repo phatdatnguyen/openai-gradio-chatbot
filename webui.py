@@ -19,7 +19,7 @@ def encode_image(image):
     image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def process_image(llm_model, text, image, history):
+def process_image(llm_model, temperature, top_p, text, image, history):
     history = history or []
     history.append({"role": "user", "content": text})
 
@@ -44,7 +44,9 @@ def process_image(llm_model, text, image, history):
                         "image_url": {"url":  f"data:image/jpeg;base64,{base64_image}"}
                     }]
             }
-        ])
+        ],
+        temperature=temperature,
+        top_p=top_p)
 
     ai_message = response.choices[0].message.content.strip()
     history.append({"role": "assistant", "content": ai_message})
@@ -87,7 +89,7 @@ def read_text_file(file_path):
         text = file.read()
     return text
 
-def process_document(llm_model, text, document, history):
+def process_document(llm_model, temperature, top_p, text, document, history):
     document_text = ""
     try:
         _, file_extension = os.path.splitext(document)
@@ -114,7 +116,9 @@ def process_document(llm_model, text, document, history):
         # API call
         response = client.chat.completions.create(
             model=llm_model,
-            messages=history
+            messages=history,
+            temperature=temperature,
+            top_p=top_p
         )
 
         ai_message = response.choices[0].message.content.strip()
@@ -124,14 +128,14 @@ def process_document(llm_model, text, document, history):
 
     return history
 
-def process_image_generation(llm_model, text, history, n_images, image_size, image_quality):
+def process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality):
     history = history or []
     history.append({"role": "user", "content": text})
 
     print(f'User: {text}')
 
     # API call
-    response = client.images.generate(model=llm_model, prompt=text, n=n_images, size=image_size, quality=image_quality)
+    response = client.images.generate(model=image_generation_model, prompt=text, n=n_images, size=image_size, quality=image_quality)
     if n_images == 1:
         ai_message = "Here is the image I generated:"
     else:
@@ -145,7 +149,7 @@ def process_image_generation(llm_model, text, history, n_images, image_size, ima
 
     return history
 
-def process_text(llm_model, text, history):
+def process_text(llm_model, temperature, top_p, text, history):
     history = history or []
     history.append({"role": "user", "content": text})
 
@@ -154,7 +158,9 @@ def process_text(llm_model, text, history):
     # API call
     response = client.chat.completions.create(
         model=llm_model,
-        messages=history
+        messages=history,
+        temperature=temperature,
+        top_p=top_p
     )
 
     ai_message = response.choices[0].message.content.strip()
@@ -164,7 +170,15 @@ def process_text(llm_model, text, history):
 
     return history
 
-def on_image_generation_model_change(image_generation_model: gr.Dropdown):
+def on_llm_model_change(llm_model):
+    if llm_model == "gpt-3.5-turbo":
+       image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None, interactive=False)
+    else:
+       image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None, interactive=True)
+
+    return image_input
+
+def on_image_generation_model_change(image_generation_model):
     if (image_generation_model) == "dall-e-3":
         n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
         image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
@@ -176,16 +190,16 @@ def on_image_generation_model_change(image_generation_model: gr.Dropdown):
     
     return n_images, image_size, image_quality
 
-def on_user_input(llm_model, text, image, document, history, generate_image, image_generation_model, n_images, image_size, image_quality):
+def on_user_input(llm_model, temperature, top_p, text, image, document, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
         if image:
-            history = process_image(llm_model, text, image, history)
+            history = process_image(llm_model, temperature, top_p, text, image, history)
         elif document:
-            history = process_document(llm_model, text, document, history)
+            history = process_document(llm_model, temperature, top_p, text, document, history)
         elif generate_image:
             history = process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality)
         elif text:
-            history = process_text(llm_model, text, history)
+            history = process_text(llm_model, temperature, top_p, text, history)
             
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", value=None)
         image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
@@ -233,8 +247,11 @@ with gr.Blocks() as demo:
             load_status = gr.Markdown(value="")
     with gr.Row():
         with gr.Column(scale=1):
-            llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=["gpt-4o-mini", "gpt-4o", "o1-preview", "o1-mini", "gpt-3.5-turbo"])
             text_input = gr.Textbox(label="Message", placeholder="Type a message or question...")
+            llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
+                "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1-preview", "o1-mini"])
+            temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
+            top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
             image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil")
             document_input = gr.File(label="Upload a document", type="filepath")
@@ -245,8 +262,9 @@ with gr.Blocks() as demo:
             image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
             image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"])
 
+    llm_model.change(on_llm_model_change, llm_model, image_input)
     image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [chatbot, state, text_input, image_input, document_input, generate_image])
+    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [chatbot, state, text_input, image_input, document_input, generate_image])
     
     save_button.click(save_history, [state, history_file_name], save_status)
     load_button.click(load_history, saved_history_file, [state, chatbot, load_status])
