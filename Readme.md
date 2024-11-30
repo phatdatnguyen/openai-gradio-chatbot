@@ -6,7 +6,7 @@
 ## Features:
 - Select different OpenAI models
 - Image analysis
-- Document analysis (PDF, MS Word, MS Excel, MS PowerPoint)
+- Document analysis (PDF, MS Word, MS Excel, MS PowerPoint, text files)
 - Image generation
 - Save and load chat history
 
@@ -20,6 +20,7 @@ git clone https://github.com/phatdatnguyen/openai-gradio-chatbot
 - Install the required packages:
 
 ```
+cd openai-gradio-chatbot
 pip install -r requirements.txt
 ```
 - Create a file name `api_key.py` and store your API key in `API_KEY` variable.
