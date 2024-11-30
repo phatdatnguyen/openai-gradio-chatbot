@@ -1,3 +1,6 @@
 gradio
 openai
 PyPDF2
+python-docx
+pandas
+python-pptx

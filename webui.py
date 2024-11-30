@@ -4,6 +4,9 @@ import base64
 import gradio as gr
 from openai import OpenAI
 import PyPDF2
+from docx import Document
+import pandas as pd
+from pptx import Presentation
 import json
 from api_key import API_KEY
 
@@ -50,32 +53,74 @@ def process_image(llm_model, text, image, history):
 
     return history
 
-def process_pdf(llm_model, text, pdf, history):
-    pdf_text = ""
+def read_pdf_file(file_path):
+    text = ""
+    with open(file_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        for page in reader.pages:
+            text += page.extract_text()
+            text += '\n'
+    return text
+
+def read_word_file(file_path):
+    document = Document(file_path)
+    text = []
+    for paragraph in document.paragraphs:
+        text.append(paragraph.text)
+    return '\n'.join(text)
+
+def read_excel_file(file_path):
+    excel_data = pd.read_excel(file_path)
+    return excel_data.to_csv(index=False)
+
+def read_powerpoint_file(file_path):
+    presentation = Presentation(file_path)
+    text = []
+    for slide in presentation.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                text.append(shape.text)
+    return '\n'.join(text)
+
+def read_text_file(file_path):
+    with open(file_path, 'tr') as file:
+        text = file.read()
+    return text
+
+def process_document(llm_model, text, document, history):
+    document_text = ""
     try:
-        with open(pdf, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                pdf_text += page.extract_text()
-                pdf_text += '\n'
-    except Exception as e:
-        pass
+        _, file_extension = os.path.splitext(document)
+        if file_extension.lower() == ".pdf":
+            document_text = read_pdf_file(document)
+        elif file_extension.lower() == ".docx":
+            document_text = read_word_file(document)
+        elif file_extension.lower() == ".xlsx":
+            document_text = read_excel_file(document)
+        elif file_extension.lower() == ".pptx":
+            document_text = read_powerpoint_file(document)
+        else:
+            document_text = read_text_file(document)
+    except:
+        gr.Warning("Cannot read this file!")
+        document_text = ""
     
-    history = history or []
-    history.append({"role": "user", "content": text + '\n' + pdf_text})
+    if not document_text == "":
+        history = history or []
+        history.append({"role": "user", "content": text + '\n' + document_text})
 
-    print(f'User: {text}\nPDF file: {os.path.basename(pdf)}')
+        print(f'User: {text}\nDocument file: {os.path.basename(document)}')
 
-    # API call
-    response = client.chat.completions.create(
-        model=llm_model,
-        messages=history
-    )
+        # API call
+        response = client.chat.completions.create(
+            model=llm_model,
+            messages=history
+        )
 
-    ai_message = response.choices[0].message.content.strip()
-    history.append({"role": "assistant", "content": ai_message})
+        ai_message = response.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": ai_message})
 
-    print(f'AI: {ai_message}')
+        print(f'AI: {ai_message}')
 
     return history
 
@@ -131,35 +176,25 @@ def on_image_generation_model_change(image_generation_model: gr.Dropdown):
     
     return n_images, image_size, image_quality
 
-def on_user_input(llm_model, text, image, pdf, history, generate_image, image_generation_model, n_images, image_size, image_quality):
+def on_user_input(llm_model, text, image, document, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
         if image:
             history = process_image(llm_model, text, image, history)
-        elif pdf:
-            history = process_pdf(llm_model, text, pdf, history)
+        elif document:
+            history = process_document(llm_model, text, document, history)
         elif generate_image:
             history = process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality)
         elif text:
             history = process_text(llm_model, text, history)
             
-        text_input = gr.Textbox(
-            placeholder="Type a message or question...",
-            show_label=False,
-            value="",
-            lines=1
-        )
-        image_input = gr.Image(
-            sources=["upload"],
-            type="pil",
-            label="Upload an image",
-            value=None
-        )
-        pdf_input = gr.File(label="Upload a PDF", type="filepath", file_types=[".pdf"])
+        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", value=None)
+        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
+        document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
-        return history, history, text_input, image_input, pdf_input, generate_image
+        return history, history, text_input, image_input, document_input, generate_image
     except Exception as exc:
         gr.Warning(str(exc.args))
-        return history, history, text_input, image_input, pdf_input, generate_image
+        return history, history, text_input, image_input, document_input, generate_image
 
 def save_history(history, history_file_name):
     try:
@@ -190,7 +225,7 @@ with gr.Blocks() as demo:
             chatbot = gr.Chatbot(type="messages", show_copy_button=True)
             state = gr.State([])
         with gr.Column(scale=1):
-            history_file_name = gr.Textbox(label="File name", lines=1, value="Chat history")    
+            history_file_name = gr.Textbox(label="File name", value="Chat history")    
             save_button = gr.Button(value="Save chat history")
             save_status = gr.Markdown(value="")
             saved_history_file = gr.File(label="Upload a chat history file", type="filepath", file_types=[".json"])
@@ -199,14 +234,10 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column(scale=1):
             llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=["gpt-4o-mini", "gpt-4o", "o1-preview", "o1-mini", "gpt-3.5-turbo"])
-            text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", lines=1)
+            text_input = gr.Textbox(label="Message", placeholder="Type a message or question...")
         with gr.Column(scale=1):
-            image_input = gr.Image(
-                sources=["upload"],
-                type="pil",
-                label="Upload an image"
-            )
-            pdf_input = gr.File(label="Upload a PDF", type="filepath", file_types=[".pdf"])
+            image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil")
+            document_input = gr.File(label="Upload a document", type="filepath")
         with gr.Column(scale=1):
             generate_image = gr.Checkbox(label="Generate image", value=False)
             image_generation_model = gr.Dropdown(label="Model", value="dall-e-3", choices=["dall-e-3", "dall-e-2"])
@@ -215,7 +246,7 @@ with gr.Blocks() as demo:
             image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"])
 
     image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, text_input, image_input, pdf_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [chatbot, state, text_input, image_input, pdf_input, generate_image])
+    text_input.submit(on_user_input, [llm_model, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [chatbot, state, text_input, image_input, document_input, generate_image])
     
     save_button.click(save_history, [state, history_file_name], save_status)
     load_button.click(load_history, saved_history_file, [state, chatbot, load_status])

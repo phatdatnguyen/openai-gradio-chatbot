@@ -6,7 +6,7 @@
 ## Features:
 - Select different OpenAI models
 - Image analysis
-- PDF input
+- Document analysis (PDF, MS Word, MS Excel, MS PowerPoint)
 - Image generation
 - Save and load chat history
 
