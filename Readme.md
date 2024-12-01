@@ -29,7 +29,4 @@ API_KEY = "<your API key>"
 ```
 ## Start web UI
 To start the web UI:
-
-```
-python webui.py
-```
+- Run `start_webui.bat`

@@ -8,6 +8,7 @@ from docx import Document
 import pandas as pd
 from pptx import Presentation
 import json
+import re
 from api_key import API_KEY
 
 client = OpenAI(
@@ -89,10 +90,28 @@ def read_text_file(file_path):
         text = file.read()
     return text
 
+def replace_document_content(history):
+    replaced_history = []
+    for message in history:
+        content = message["content"]
+        pattern = r'(?s)<<<DOCUMENT_CONTENT>>>\nFile: (.*?)\n.*?<<<END_DOCUMENT>>>'
+        def repl(match):
+            file_name = match.group(1)
+            return f'[File: {file_name}]'
+        replaced_content = re.sub(pattern, repl, content)
+        replaced_message = {
+                "role": message["role"],
+                "content": replaced_content
+            }
+        replaced_history.append(replaced_message)
+
+    return replaced_history
+
 def process_document(llm_model, temperature, top_p, text, document, history):
     document_text = ""
     try:
         _, file_extension = os.path.splitext(document)
+        file_name = os.path.basename(document)
         if file_extension.lower() == ".pdf":
             document_text = read_pdf_file(document)
         elif file_extension.lower() == ".docx":
@@ -103,6 +122,8 @@ def process_document(llm_model, temperature, top_p, text, document, history):
             document_text = read_powerpoint_file(document)
         else:
             document_text = read_text_file(document)
+
+        document_text = f"<<<DOCUMENT_CONTENT>>>\nFile: {file_name}\n{document_text}\n<<<END_DOCUMENT>>>"
     except:
         gr.Warning("Cannot read this file!")
         document_text = ""
@@ -111,7 +132,7 @@ def process_document(llm_model, temperature, top_p, text, document, history):
         history = history or []
         history.append({"role": "user", "content": text + '\n' + document_text})
 
-        print(f'User: {text}\nDocument file: {os.path.basename(document)}')
+        print(f'User: {text}\nUser uploaded file: {os.path.basename(document)}')
 
         # API call
         response = client.chat.completions.create(
@@ -201,14 +222,20 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
         elif text:
             history = process_text(llm_model, temperature, top_p, text, history)
             
-        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", value=None)
+        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
         image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
-        return history, history, text_input, image_input, document_input, generate_image
+        replaced_history = replace_document_content(history)
+        return history, replaced_history, text_input, image_input, document_input, generate_image
     except Exception as exc:
         gr.Warning(str(exc.args))
-        return history, history, text_input, image_input, document_input, generate_image
+        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
+        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
+        document_input = gr.File(label="Upload a document", type="filepath", value=None)
+        generate_image = gr.Checkbox(label="Generate image", value=False)
+        replaced_history = replace_document_content(history)
+        return history, replaced_history, text_input, image_input, document_input, generate_image
 
 def save_history(history, history_file_name):
     try:
@@ -216,8 +243,8 @@ def save_history(history, history_file_name):
             raise Exception("No history")
         
         os.makedirs("history", exist_ok=True)
-        with open(f"./history/{history_file_name}.json", "w") as file:
-            json.dump(history, file, indent=4)
+        with open(f"./history/{history_file_name}.json", "w", encoding='utf8') as file:
+            json.dump(history, file, indent=4, ensure_ascii=False)
         return "Chat history saved successfully!"
     except Exception as exc:
         return f"Error saving history: {str(exc)}"
@@ -227,9 +254,9 @@ def load_history(saved_history_file):
         if not saved_history_file:
             raise Exception("No history file")
         
-        with open(saved_history_file, "r") as file:
+        with open(saved_history_file, "r", encoding='utf8') as file:
             history = json.load(file)
-        return history, history, "Chat history loaded successfully!"
+        return history, replace_document_content(history), "Chat history loaded successfully!"
     except Exception as exc:
         return [], [], f"Error loading history: {str(exc)}"
     
@@ -247,7 +274,7 @@ with gr.Blocks() as demo:
             load_status = gr.Markdown(value="")
     with gr.Row():
         with gr.Column(scale=1):
-            text_input = gr.Textbox(label="Message", placeholder="Type a message or question...")
+            text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
             llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
                 "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1-preview", "o1-mini"])
             temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
@@ -264,7 +291,7 @@ with gr.Blocks() as demo:
 
     llm_model.change(on_llm_model_change, llm_model, image_input)
     image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [chatbot, state, text_input, image_input, document_input, generate_image])
+    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [state, chatbot, text_input, image_input, document_input, generate_image])
     
     save_button.click(save_history, [state, history_file_name], save_status)
     load_button.click(load_history, saved_history_file, [state, chatbot, load_status])
