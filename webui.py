@@ -192,7 +192,7 @@ def process_text(llm_model, temperature, top_p, text, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model == "gpt-3.5-turbo":
+    if llm_model in ["gpt-3.5-turbo", "o1-preview", "o1-mini"]:
        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None, interactive=False)
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None, interactive=True)
@@ -280,7 +280,7 @@ with gr.Blocks() as demo:
             temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
             top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
-            image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil")
+            image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil")
             document_input = gr.File(label="Upload a document", type="filepath")
         with gr.Column(scale=1):
             generate_image = gr.Checkbox(label="Generate image", value=False)
