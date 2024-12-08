@@ -223,7 +223,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
             history = process_text(llm_model, temperature, top_p, text, history)
             
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
-        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
+        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
         replaced_history = replace_document_content(history)
@@ -231,7 +231,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
     except Exception as exc:
         gr.Warning(str(exc.args))
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
-        image_input = gr.Image(label="Upload an image", sources=["upload"], type="pil", value=None)
+        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
         replaced_history = replace_document_content(history)
