@@ -1,5 +1,9 @@
 import os
 import io
+import json
+import re
+import requests
+from PIL import Image
 import base64
 import gradio as gr
 from openai import OpenAI
@@ -7,8 +11,6 @@ import PyPDF2
 from docx import Document
 import pandas as pd
 from pptx import Presentation
-import json
-import re
 from api_key import API_KEY
 
 client = OpenAI(
@@ -20,14 +22,25 @@ def encode_image(image):
     image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
+def encode_image_from_url(url):
+    response = requests.get(url)
+    response.raise_for_status()  # Raise an error for bad responses (4xx or 5xx)
+    
+    # Open the image using Pillow
+    image = Image.open(io.BytesIO(response.content))
+    
+    # Encode the image
+    return encode_image(image)
+
 def process_image(llm_model, temperature, top_p, text, image, history):
-    history = history or []
-    history.append({"role": "user", "content": text})
-
-    print(f'User: {text}\nImage: {image}')
-
+    
     # Getting the base64 string
     base64_image = encode_image(image)
+
+    history = history or []
+    history.append({"role": "user", "content": text, "image_url": f"data:image/jpeg;base64,{base64_image}"})
+
+    print(f'User: {text}\nImage: {image}')
 
     # API call
     response = client.chat.completions.create(
@@ -90,15 +103,23 @@ def read_text_file(file_path):
         text = file.read()
     return text
 
-def replace_document_content(history):
+def replace_history_content(history):
     replaced_history = []
     for message in history:
         content = message["content"]
+
+        # Replace document content with document file name
         pattern = r'(?s)<<<DOCUMENT_CONTENT>>>\nFile: (.*?)\n.*?<<<END_DOCUMENT>>>'
         def repl(match):
             file_name = match.group(1)
             return f'[File: {file_name}]'
         replaced_content = re.sub(pattern, repl, content)
+
+        # Add encoded image
+        if "image_url" in message:
+            image_url = message["image_url"]
+            replaced_content += f'\n![Image]({image_url})'
+        
         replaced_message = {
                 "role": message["role"],
                 "content": replaced_content
@@ -155,15 +176,20 @@ def process_image_generation(image_generation_model, text, history, n_images, im
 
     print(f'User: {text}')
 
+    prompt = ""
+    for message in history:
+        prompt += f'{message["role"]}: {message["content"]}\n'
+
     # API call
-    response = client.images.generate(model=image_generation_model, prompt=text, n=n_images, size=image_size, quality=image_quality)
+    response = client.images.generate(model=image_generation_model, prompt=prompt, n=n_images, size=image_size, quality=image_quality)
     if n_images == 1:
         ai_message = "Here is the image I generated:"
     else:
         ai_message = "Here are the images I generated:"
     for i in range(len(response.data)):
         image_url = response.data[i].url
-        ai_message += f"\n![Image {i + 1}]({image_url})"
+        base64_image = encode_image_from_url(image_url)
+        ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
     history.append({"role": "assistant", "content": ai_message})
 
     print(f'AI: {ai_message}')
@@ -226,7 +252,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
-        replaced_history = replace_document_content(history)
+        replaced_history = replace_history_content(history)
         return history, replaced_history, text_input, image_input, document_input, generate_image
     except Exception as exc:
         gr.Warning(str(exc.args))
@@ -234,7 +260,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
-        replaced_history = replace_document_content(history)
+        replaced_history = replace_history_content(history)
         return history, replaced_history, text_input, image_input, document_input, generate_image
 
 def save_history(history, history_file_name):
@@ -256,7 +282,7 @@ def load_history(saved_history_file):
         
         with open(saved_history_file, "r", encoding='utf8') as file:
             history = json.load(file)
-        return history, replace_document_content(history), "Chat history loaded successfully!"
+        return history, replace_history_content(history), "Chat history loaded successfully!"
     except Exception as exc:
         return [], [], f"Error loading history: {str(exc)}"
     
