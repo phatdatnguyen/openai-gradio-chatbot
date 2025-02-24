@@ -99,7 +99,7 @@ def read_powerpoint_file(file_path):
     return '\n'.join(text)
 
 def read_text_file(file_path):
-    with open(file_path, 'tr') as file:
+    with open(file_path, 'tr', encoding="utf-8") as file:
         text = file.read()
     return text
 
@@ -145,8 +145,8 @@ def process_document(llm_model, temperature, top_p, text, document, history):
             document_text = read_text_file(document)
 
         document_text = f"<<<DOCUMENT_CONTENT>>>\nFile: {file_name}\n{document_text}\n<<<END_DOCUMENT>>>"
-    except:
-        gr.Warning("Cannot read this file!")
+    except Exception as exc:
+        gr.Warning("Cannot read this file!\n" + str(exc.args))
         document_text = ""
     
     if not document_text == "":
@@ -218,7 +218,7 @@ def process_text(llm_model, temperature, top_p, text, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["gpt-3.5-turbo", "o1-preview", "o1-mini"]:
+    if llm_model in ["gpt-3.5-turbo", "o1", "o1-preview", "o1-mini", "o3-mini"]:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=False)
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=True)
@@ -302,7 +302,7 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
             llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
-                "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1-preview", "o1-mini"])
+                "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1", "o1-preview", "o1-mini", "o3-mini"])
             temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
             top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
