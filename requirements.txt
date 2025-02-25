@@ -1,6 +1,9 @@
+numpy
+pandas
 gradio
 openai
+urllib3
+html2text
 PyPDF2
 python-docx
-pandas
 python-pptx
