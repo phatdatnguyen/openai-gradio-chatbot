@@ -1,8 +1,11 @@
 import os
 import io
 import json
+import glob
 import re
 import requests
+import urllib3
+import html2text
 from PIL import Image
 import base64
 import gradio as gr
@@ -33,7 +36,6 @@ def encode_image_from_url(url):
     return encode_image(image)
 
 def process_image(llm_model, temperature, top_p, text, image, history):
-    
     # Getting the base64 string
     base64_image = encode_image(image)
 
@@ -98,8 +100,13 @@ def read_powerpoint_file(file_path):
                 text.append(shape.text)
     return '\n'.join(text)
 
+def read_html_file(file_path):
+    with open(file_path, 'tr', encoding="utf-8") as file:
+        text = file.read()
+    return html2text.html2text(text)
+
 def read_text_file(file_path):
-    with open(file_path, 'tr') as file:
+    with open(file_path, 'tr', encoding="utf-8") as file:
         text = file.read()
     return text
 
@@ -114,6 +121,13 @@ def replace_history_content(history):
             file_name = match.group(1)
             return f'[File: {file_name}]'
         replaced_content = re.sub(pattern, repl, content)
+
+        # Replace link content with URL
+        pattern = r'(?s)<<<LINK_CONTENT>>>\nURL: (.*?)\n.*?<<<END_LINK>>>'
+        def repl(match):
+            url = match.group(1)
+            return f'[URL: {url}]'
+        replaced_content = re.sub(pattern, repl, replaced_content)
 
         # Add encoded image
         if "image_url" in message:
@@ -141,12 +155,14 @@ def process_document(llm_model, temperature, top_p, text, document, history):
             document_text = read_excel_file(document)
         elif file_extension.lower() == ".pptx":
             document_text = read_powerpoint_file(document)
+        elif file_extension.lower() == ".htm" or file_extension.lower() == ".html":
+            document_text = read_html_file(document)
         else:
             document_text = read_text_file(document)
 
         document_text = f"<<<DOCUMENT_CONTENT>>>\nFile: {file_name}\n{document_text}\n<<<END_DOCUMENT>>>"
-    except:
-        gr.Warning("Cannot read this file!")
+    except Exception as exc:
+        gr.Warning("Cannot read this file!\n" + str(exc.args))
         document_text = ""
     
     if not document_text == "":
@@ -196,8 +212,24 @@ def process_image_generation(image_generation_model, text, history, n_images, im
 
     return history
 
-def process_text(llm_model, temperature, top_p, text, history):
+def process_text(llm_model, temperature, top_p, text, url, history):
     history = history or []
+
+    if url:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        http = urllib3.PoolManager()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        }
+        response = http.request("GET", url, headers=headers)
+        if response.status == 200:
+            html = response.data.decode('utf-8')
+        else:
+            html = f"Failed to retrieve the webpage. Status code: {response.status}"
+            gr.Warning(html + '\nYou can try downloading the web page as a HTML file and loading it as a document input.')
+        
+        html_text = html2text.html2text(html)
+        text += f'\n<<<LINK_CONTENT>>>\nURL: {url}\n{html_text}\n<<<END_LINK>>>'
     history.append({"role": "user", "content": text})
 
     print(f'User: {text}')
@@ -218,7 +250,7 @@ def process_text(llm_model, temperature, top_p, text, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["gpt-3.5-turbo", "o1", "o1-mini", "o1-preview", "o3-mini"]:
+    if llm_model in ["gpt-3.5-turbo", "o1", "o1-preview", "o1-mini", "o3-mini"]:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=False)
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=True)
@@ -237,7 +269,7 @@ def on_image_generation_model_change(image_generation_model):
     
     return n_images, image_size, image_quality
 
-def on_user_input(llm_model, temperature, top_p, text, image, document, history, generate_image, image_generation_model, n_images, image_size, image_quality):
+def on_user_input(llm_model, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
         if image:
             history = process_image(llm_model, temperature, top_p, text, image, history)
@@ -246,22 +278,45 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, history,
         elif generate_image:
             history = process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality)
         elif text:
-            history = process_text(llm_model, temperature, top_p, text, history)
+            history = process_text(llm_model, temperature, top_p, text, url, history)
             
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
+        url_input = gr.Textbox(label="Link", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
         replaced_history = replace_history_content(history)
-        return history, replaced_history, text_input, image_input, document_input, generate_image
+        return history, replaced_history, text_input, image_input, document_input, url_input, generate_image
     except Exception as exc:
         gr.Warning(str(exc.args))
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
+        url_input = gr.Textbox(label="Link", value=None)
         generate_image = gr.Checkbox(label="Generate image", value=False)
         replaced_history = replace_history_content(history)
-        return history, replaced_history, text_input, image_input, document_input, generate_image
+        return history, replaced_history, text_input, image_input, document_input, url_input, generate_image
+
+def on_new_chat_click():
+    history = []
+    state = []
+    return history, state
+
+def on_toggle_history_column(state):
+    state = not state
+    return gr.update(visible = state), state
+
+def get_history_file_list():
+    history_file_list = []
+    for file in glob.glob('.\\history\\*.json', recursive=True):
+        history_file_list.append(os.path.splitext(os.path.basename(file))[0])
+
+    return history_file_list
+
+def select_history_file(evt: gr.SelectData):
+    row_index = evt.index[0]
+    history_file = get_history_file_list()[row_index]
+    return history_file
 
 def save_history(history, history_file_name):
     try:
@@ -271,56 +326,67 @@ def save_history(history, history_file_name):
         os.makedirs("history", exist_ok=True)
         with open(f"./history/{history_file_name}.json", "w", encoding='utf8') as file:
             json.dump(history, file, indent=4, ensure_ascii=False)
-        return "Chat history saved successfully!"
+        return "Chat history saved successfully!", pd.DataFrame(get_history_file_list(), columns=["File name"])
     except Exception as exc:
-        return f"Error saving history: {str(exc)}"
+        return f"Error saving history: {str(exc)}", pd.DataFrame(get_history_file_list(), columns=["File name"])
 
-def load_history(saved_history_file):
+def load_history(history_file_name: gr.Textbox):
     try:
-        if not saved_history_file:
-            raise Exception("No history file")
-        
-        with open(saved_history_file, "r", encoding='utf8') as file:
+        history_file_path = f"./history/{history_file_name}.json"
+        with open(history_file_path, "r", encoding='utf8') as file:
             history = json.load(file)
         return history, replace_history_content(history), "Chat history loaded successfully!"
     except Exception as exc:
         return [], [], f"Error loading history: {str(exc)}"
-    
+
 with gr.Blocks() as demo:
     with gr.Row(equal_height=True):
         with gr.Column(scale=4):
             chatbot = gr.Chatbot(type="messages", show_copy_button=True)
             state = gr.State([])
-        with gr.Column(scale=1):
-            history_file_name = gr.Textbox(label="File name", value="Chat history")    
-            save_button = gr.Button(value="Save chat history")
-            save_status = gr.Markdown(value="")
-            saved_history_file = gr.File(label="Upload a chat history file", type="filepath", file_types=[".json"])
+            history_column_state = gr.State(True)
+            with gr.Row(equal_height=True):
+                new_chat_button = gr.Button(value="New chat")
+                toggle_history_column_button = gr.Button(value="Toggle chat history")
+        with gr.Column(scale=1) as history_column:
+            history_files_list = gr.DataFrame(label="Chat history files", value=pd.DataFrame(get_history_file_list(), columns=["File name"]), max_height=260)
+            history_file_name = gr.Textbox(label="File name", value="Chat history")
             load_button = gr.Button(value="Load chat history")
             load_status = gr.Markdown(value="")
+            save_button = gr.Button(value="Save chat history")
+            save_status = gr.Markdown(value="")
     with gr.Row():
         with gr.Column(scale=1):
-            text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
-            llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
-                "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o1-preview", "o3-mini"])
-            temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
-            top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
+            with gr.Accordion(label="Prompt"):
+                text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
+                llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
+                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1", "o1-preview", "o1-mini", "o3-mini"])
+                temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
+                top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
-            image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil")
-            document_input = gr.File(label="Upload a document", type="filepath")
+            with gr.Accordion(label="Input"):
+                image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil")
+                document_input = gr.File(label="Upload a document", type="filepath")
+                url_input = gr.Textbox(label="Link")
         with gr.Column(scale=1):
-            generate_image = gr.Checkbox(label="Generate image", value=False)
-            image_generation_model = gr.Dropdown(label="Model", value="dall-e-3", choices=["dall-e-3", "dall-e-2"])
-            n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
-            image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
-            image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"])
+            with gr.Accordion(label="Image generation"):
+                generate_image = gr.Checkbox(label="Generate image", value=False)
+                image_generation_model = gr.Dropdown(label="Model", value="dall-e-3", choices=["dall-e-3", "dall-e-2"])
+                n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
+                image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
+                image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"])
+
+    new_chat_button.click(on_new_chat_click, [], [chatbot, state])
+    toggle_history_column_button.click(on_toggle_history_column, history_column_state, [history_column, history_column_state])
 
     llm_model.change(on_llm_model_change, llm_model, image_input)
     image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, state, generate_image, image_generation_model, n_images, image_size, image_quality], [state, chatbot, text_input, image_input, document_input, generate_image])
+    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_generation_model, n_images, image_size, image_quality],
+                      [state, chatbot, text_input, image_input, document_input, url_input, generate_image])
     
-    save_button.click(save_history, [state, history_file_name], save_status)
-    load_button.click(load_history, saved_history_file, [state, chatbot, load_status])
+    history_files_list.select(select_history_file, [], history_file_name)
+    load_button.click(load_history, history_file_name, [state, chatbot, load_status])
+    save_button.click(save_history, [state, history_file_name], [save_status, history_files_list])
 
 demo.launch(max_file_size=100*gr.FileSize.MB)
 
