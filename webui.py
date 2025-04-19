@@ -250,24 +250,16 @@ def process_text(llm_model, temperature, top_p, text, url, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["gpt-3.5-turbo", "o1", "o1-preview", "o1-mini", "o3-mini"]:
-       image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=False)
+    if llm_model in ["gpt-3.5-turbo", "o1-mini", "o3-mini"]: # these models do not have vision capabilities
+       return gr.update(interactive=False)
     else:
-       image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None, interactive=True)
-
-    return image_input
+       return gr.update(interactive=True)
 
 def on_image_generation_model_change(image_generation_model):
     if (image_generation_model) == "dall-e-3":
-        n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
-        image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
-        image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"], interactive=True)
+        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1792x1024", "1024x1792"]), gr.update(interactive=True)
     else:
-        n_images = gr.Slider(label="Number of images", minimum=1, maximum=5, step=1, value=1, interactive=True)
-        image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["256x256", "512x512", "1024x1024"])
-        image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard"], interactive=False)
-    
-    return n_images, image_size, image_quality
+        return gr.update(interactive=True), gr.update(choices=["256x256", "512x512", "1024x1024"]), gr.update(interactive=False)
 
 def on_user_input(llm_model, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
@@ -298,9 +290,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, url, his
         return history, replaced_history, text_input, image_input, document_input, url_input, generate_image
 
 def on_new_chat_click():
-    history = []
-    state = []
-    return history, state
+    return [], []
 
 def on_toggle_history_column(state):
     state = not state
@@ -359,8 +349,8 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             with gr.Accordion(label="Prompt"):
                 text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
-                llm_model = gr.Dropdown(label="Model", value="gpt-4o-mini", choices=[
-                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest",  "o1", "o1-preview", "o1-mini", "o3-mini"])
+                llm_model = gr.Dropdown(label="Model", value="gpt-4.1-mini", choices=[
+                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5-preview", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o3", "o3-mini", "o4-mini"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
