@@ -197,19 +197,36 @@ def process_image_generation(image_generation_model, text, history, n_images, im
         prompt += f'{message["role"]}: {message["content"]}\n'
 
     # API call
-    response = client.images.generate(model=image_generation_model, prompt=prompt, n=n_images, size=image_size, quality=image_quality)
-    if n_images == 1:
+    if image_generation_model == "gpt-image-1":
+        response = client.images.generate(model=image_generation_model, prompt=prompt, size=image_size, quality=image_quality)
         ai_message = "Here is the image I generated:"
-    else:
-        ai_message = "Here are the images I generated:"
-    for i in range(len(response.data)):
-        image_url = response.data[i].url
-        base64_image = encode_image_from_url(image_url)
-        ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-    history.append({"role": "assistant", "content": ai_message})
-
-    print(f'AI: {ai_message}')
-
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            base64_image = response.data[i].b64_json
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+    elif image_generation_model == "dall-e-3":
+        response = client.images.generate(model=image_generation_model, prompt=prompt, size=image_size, quality=image_quality)
+        ai_message = "Here is the image I generated:"
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            image_url = response.data[i].url
+            base64_image = encode_image_from_url(image_url)
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+    else: # image_generation_model == "dall-e-2":
+        response = client.images.generate(model=image_generation_model, prompt=prompt, n=n_images, size=image_size)
+        if n_images == 1:
+            ai_message = "Here is the image I generated:"
+        else:
+            ai_message = "Here are the images I generated:"
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            image_url = response.data[i].url
+            base64_image = encode_image_from_url(image_url)
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+        
     return history
 
 def process_text(llm_model, temperature, top_p, text, url, history):
@@ -256,10 +273,12 @@ def on_llm_model_change(llm_model):
        return gr.update(interactive=True)
 
 def on_image_generation_model_change(image_generation_model):
+    if (image_generation_model) == "gpt-image-1":
+        return gr.update(interactive=False), gr.update(choices=["auto", "1024x1024", "1536x1024", "1024x1536"], value="auto"), gr.update(interactive=True, choices=["auto", "low", "medium", "high"], value="auto")
     if (image_generation_model) == "dall-e-3":
-        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1792x1024", "1024x1792"]), gr.update(interactive=True)
+        return gr.update(interactive=False), gr.update(choices=["auto", "1024x1024", "1792x1024", "1024x1792"], value="1024x1024"), gr.update(interactive=True, choices=["standard", "hd"], value="standard")
     else:
-        return gr.update(interactive=True), gr.update(choices=["256x256", "512x512", "1024x1024"]), gr.update(interactive=False)
+        return gr.update(interactive=True), gr.update(choices=["auto", "256x256", "512x512", "1024x1024"], value="1024x1024"), gr.update(interactive=False, choices=["standard", "hd"], value="standard")
 
 def on_user_input(llm_model, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
@@ -361,10 +380,10 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             with gr.Accordion(label="Image generation"):
                 generate_image = gr.Checkbox(label="Generate image", value=False)
-                image_generation_model = gr.Dropdown(label="Model", value="dall-e-3", choices=["dall-e-3", "dall-e-2"])
+                image_generation_model = gr.Dropdown(label="Model", value="gpt-image-1", choices=["gpt-image-1", "dall-e-3", "dall-e-2"])
                 n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
-                image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1792x1024", "1024x1792"])
-                image_quality = gr.Dropdown(label="Image quality", value="standard", choices=["standard", "hd"])
+                image_size = gr.Dropdown(label="Image size", value="auto", choices=["auto", "1024x1024", "1536x1024", "1024x1536"])
+                image_quality = gr.Dropdown(label="Image quality", value="auto", choices=["auto", "low", "medium", "high"])
 
     new_chat_button.click(on_new_chat_click, [], [chatbot, state])
     toggle_history_column_button.click(on_toggle_history_column, history_column_state, [history_column, history_column_state])
