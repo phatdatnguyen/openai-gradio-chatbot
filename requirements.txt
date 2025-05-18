@@ -2,6 +2,7 @@ numpy
 pandas
 gradio
 openai
+tiktoken
 urllib3
 html2text
 PyPDF2
