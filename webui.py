@@ -4,6 +4,7 @@ import json
 import glob
 import re
 import requests
+import tiktoken
 import urllib3
 import html2text
 from PIL import Image
@@ -35,8 +36,9 @@ def encode_image_from_url(url):
     # Encode the image
     return encode_image(image)
 
-def process_image(llm_model, temperature, top_p, text, image, history):
+def process_image(llm_model, temperature, top_p, text, image_path, history):
     # Getting the base64 string
+    image = Image.open(image_path)
     base64_image = encode_image(image)
 
     history = history or []
@@ -142,6 +144,100 @@ def replace_history_content(history):
 
     return replaced_history
 
+MODEL_TOKEN_LIMITS = {
+    "gpt-3.5-turbo": 4096,
+    "gpt-4": 8192,
+    "gpt-4-turbo": 128000,
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "chatgpt-4o-latest": 128000,
+    "o1": 128000,
+    "o1-mini": 128000,
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o4-mini": 200000,
+    "gpt-4.5-preview": 128000
+}
+
+def get_max_context_tokens(model_name):
+    return MODEL_TOKEN_LIMITS.get(model_name, 4096)  # Default fallback
+
+def count_tokens(messages, model):
+    encoding = tiktoken.encoding_for_model(model)
+    num_tokens = 0
+    for msg in messages:
+        # Every message has metadata overhead
+        num_tokens += 4  # for role/content/...
+        for key, value in msg.items():  
+            num_tokens += len(encoding.encode(value))
+    num_tokens += 2  # priming token overhead
+    return num_tokens
+
+def trim_history(history, model, reserved_tokens=2000):
+    if not history:
+        return []
+
+    trimmed_history = []
+    total_tokens = 0
+    max_context = get_max_context_tokens(model)
+    max_input_tokens = max_context - reserved_tokens
+
+    # Reverse iterate to keep most recent messages
+    for message in reversed(history):
+        message_tokens = count_tokens([message], model)
+        if total_tokens + message_tokens <= max_input_tokens:
+            trimmed_history.insert(0, message)  # Insert at the beginning to maintain order
+            total_tokens += message_tokens
+        else:
+            break
+
+    return trimmed_history
+
+def process_image_generation(image_generation_model, image_path, text, history, n_images, image_size, image_quality):
+    history = history or []
+    history.append({"role": "user", "content": text})
+
+    print(f'User: {text}')
+
+    # API call
+    if image_generation_model == "gpt-image-1":
+        if image_path:
+            response = client.images.edit(image=[open(image_path, "rb"),], model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
+        else:
+            response = client.images.generate(model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
+        ai_message = "Here is the image I generated:"
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            base64_image = response.data[i].b64_json
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+    elif image_generation_model == "dall-e-3":
+        response = client.images.generate(model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
+        ai_message = "Here is the image I generated:"
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            image_url = response.data[i].url
+            base64_image = encode_image_from_url(image_url)
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+    else: # image_generation_model == "dall-e-2":
+        response = client.images.generate(model=image_generation_model, prompt=text, n=n_images, size=image_size)
+        if n_images == 1:
+            ai_message = "Here is the image I generated:"
+        else:
+            ai_message = "Here are the images I generated:"
+        print(f'AI: {ai_message}')
+        for i in range(len(response.data)):
+            image_url = response.data[i].url
+            base64_image = encode_image_from_url(image_url)
+            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+        history.append({"role": "assistant", "content": ai_message})
+        
+    return history
+
 def process_document(llm_model, temperature, top_p, text, document, history):
     document_text = ""
     try:
@@ -174,7 +270,7 @@ def process_document(llm_model, temperature, top_p, text, document, history):
         # API call
         response = client.chat.completions.create(
             model=llm_model,
-            messages=history,
+            messages=trim_history(history, llm_model),
             temperature=temperature,
             top_p=top_p
         )
@@ -184,49 +280,6 @@ def process_document(llm_model, temperature, top_p, text, document, history):
 
         print(f'AI: {ai_message}')
 
-    return history
-
-def process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality):
-    history = history or []
-    history.append({"role": "user", "content": text})
-
-    print(f'User: {text}')
-
-    prompt = ""
-    for message in history:
-        prompt += f'{message["role"]}: {message["content"]}\n'
-
-    # API call
-    if image_generation_model == "gpt-image-1":
-        response = client.images.generate(model=image_generation_model, prompt=prompt, size=image_size, quality=image_quality)
-        ai_message = "Here is the image I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            base64_image = response.data[i].b64_json
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-        history.append({"role": "assistant", "content": ai_message})
-    elif image_generation_model == "dall-e-3":
-        response = client.images.generate(model=image_generation_model, prompt=prompt, size=image_size, quality=image_quality)
-        ai_message = "Here is the image I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            image_url = response.data[i].url
-            base64_image = encode_image_from_url(image_url)
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-        history.append({"role": "assistant", "content": ai_message})
-    else: # image_generation_model == "dall-e-2":
-        response = client.images.generate(model=image_generation_model, prompt=prompt, n=n_images, size=image_size)
-        if n_images == 1:
-            ai_message = "Here is the image I generated:"
-        else:
-            ai_message = "Here are the images I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            image_url = response.data[i].url
-            base64_image = encode_image_from_url(image_url)
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-        history.append({"role": "assistant", "content": ai_message})
-        
     return history
 
 def process_text(llm_model, temperature, top_p, text, url, history):
@@ -254,7 +307,7 @@ def process_text(llm_model, temperature, top_p, text, url, history):
     # API call
     response = client.chat.completions.create(
         model=llm_model,
-        messages=history,
+        messages=trim_history(history, llm_model),
         temperature=temperature,
         top_p=top_p
     )
@@ -273,21 +326,21 @@ def on_llm_model_change(llm_model):
        return gr.update(interactive=True)
 
 def on_image_generation_model_change(image_generation_model):
-    if (image_generation_model) == "gpt-image-1":
-        return gr.update(interactive=False), gr.update(choices=["auto", "1024x1024", "1536x1024", "1024x1536"], value="auto"), gr.update(interactive=True, choices=["auto", "low", "medium", "high"], value="auto")
-    if (image_generation_model) == "dall-e-3":
-        return gr.update(interactive=False), gr.update(choices=["auto", "1024x1024", "1792x1024", "1024x1792"], value="1024x1024"), gr.update(interactive=True, choices=["standard", "hd"], value="standard")
-    else:
-        return gr.update(interactive=True), gr.update(choices=["auto", "256x256", "512x512", "1024x1024"], value="1024x1024"), gr.update(interactive=False, choices=["standard", "hd"], value="standard")
+    if image_generation_model == "gpt-image-1":
+        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1536x1024", "1024x1536"], value="1024x1024"), gr.update(interactive=True, choices=["auto", "low", "medium", "high"], value="auto")
+    if image_generation_model == "dall-e-3":
+        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1792x1024", "1024x1792"], value="1024x1024"), gr.update(interactive=True, choices=["standard", "hd"], value="standard")
+    else: #image_generation_model == "dall-e-2"
+        return gr.update(interactive=True), gr.update(choices=["256x256", "512x512", "1024x1024"], value="1024x1024"), gr.update(interactive=False, choices=["standard"], value="standard")
 
 def on_user_input(llm_model, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
-        if image:
+        if generate_image:
+            history = process_image_generation(image_generation_model, image, text, history, n_images, image_size, image_quality)
+        elif image:
             history = process_image(llm_model, temperature, top_p, text, image, history)
         elif document:
             history = process_document(llm_model, temperature, top_p, text, document, history)
-        elif generate_image:
-            history = process_image_generation(image_generation_model, text, history, n_images, image_size, image_quality)
         elif text:
             history = process_text(llm_model, temperature, top_p, text, url, history)
             
@@ -374,7 +427,7 @@ with gr.Blocks() as demo:
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
             with gr.Accordion(label="Input"):
-                image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil")
+                image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath")
                 document_input = gr.File(label="Upload a document", type="filepath")
                 url_input = gr.Textbox(label="Link")
         with gr.Column(scale=1):
@@ -382,7 +435,7 @@ with gr.Blocks() as demo:
                 generate_image = gr.Checkbox(label="Generate image", value=False)
                 image_generation_model = gr.Dropdown(label="Model", value="gpt-image-1", choices=["gpt-image-1", "dall-e-3", "dall-e-2"])
                 n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
-                image_size = gr.Dropdown(label="Image size", value="auto", choices=["auto", "1024x1024", "1536x1024", "1024x1536"])
+                image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1536x1024", "1024x1536"])
                 image_quality = gr.Dropdown(label="Image quality", value="auto", choices=["auto", "low", "medium", "high"])
 
     new_chat_button.click(on_new_chat_click, [], [chatbot, state])
