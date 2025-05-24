@@ -162,11 +162,25 @@ MODEL_TOKEN_LIMITS = {
     "gpt-4.5-preview": 128000
 }
 
-def get_max_context_tokens(model_name):
-    return MODEL_TOKEN_LIMITS.get(model_name, 4096)  # Default fallback
+MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
+    "gpt-4.1": 128000,
+    "gpt-4.1-mini": 128000,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+}
+
+
+def get_max_context_tokens(model_name, web_search=False):
+    if web_search:
+        return MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH.get(model_name, 128000)  # Default fallback
+    else:
+        return MODEL_TOKEN_LIMITS.get(model_name, 4096)  # Default fallback
 
 def count_tokens(messages, model):
-    encoding = tiktoken.encoding_for_model(model)
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except:
+        encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for msg in messages:
         # Every message has metadata overhead
@@ -176,13 +190,13 @@ def count_tokens(messages, model):
     num_tokens += 2  # priming token overhead
     return num_tokens
 
-def trim_history(history, model, reserved_tokens=2000):
+def trim_history(history, model, web_search=False, reserved_tokens=2000):
     if not history:
         return []
 
     trimmed_history = []
     total_tokens = 0
-    max_context = get_max_context_tokens(model)
+    max_context = get_max_context_tokens(model, web_search)
     max_input_tokens = max_context - reserved_tokens
 
     # Reverse iterate to keep most recent messages
@@ -238,7 +252,7 @@ def process_image_generation(image_generation_model, image_path, text, history, 
         
     return history
 
-def process_document(llm_model, temperature, top_p, text, document, history):
+def process_document(llm_model, web_search, temperature, top_p, text, document, history):
     document_text = ""
     try:
         _, file_extension = os.path.splitext(document)
@@ -267,7 +281,21 @@ def process_document(llm_model, temperature, top_p, text, document, history):
 
         print(f'User: {text}\nUser uploaded file: {os.path.basename(document)}')
 
-        # API call
+    # API call
+    if web_search != "None":
+        response = client.responses.create(
+            model=llm_model,
+            input=trim_history(history, llm_model, web_search=True),
+            tools=[{
+                "type": "web_search_preview",
+                "search_context_size": web_search,
+            }],
+            temperature=temperature,
+            top_p=top_p
+        )
+
+        ai_message = response.output_text
+    else:
         response = client.chat.completions.create(
             model=llm_model,
             messages=trim_history(history, llm_model),
@@ -276,13 +304,14 @@ def process_document(llm_model, temperature, top_p, text, document, history):
         )
 
         ai_message = response.choices[0].message.content.strip()
-        history.append({"role": "assistant", "content": ai_message})
+        
+    history.append({"role": "assistant", "content": ai_message})
 
-        print(f'AI: {ai_message}')
+    print(f'AI: {ai_message}')
 
     return history
 
-def process_text(llm_model, temperature, top_p, text, url, history):
+def process_text(llm_model, web_search, temperature, top_p, text, url, history):
     history = history or []
 
     if url:
@@ -305,14 +334,29 @@ def process_text(llm_model, temperature, top_p, text, url, history):
     print(f'User: {text}')
 
     # API call
-    response = client.chat.completions.create(
-        model=llm_model,
-        messages=trim_history(history, llm_model),
-        temperature=temperature,
-        top_p=top_p
-    )
+    if web_search != "None":
+        response = client.responses.create(
+            model=llm_model,
+            input=trim_history(history, llm_model, web_search=True),
+            tools=[{
+                "type": "web_search_preview",
+                "search_context_size": web_search,
+            }],
+            temperature=temperature,
+            top_p=top_p
+        )
 
-    ai_message = response.choices[0].message.content.strip()
+        ai_message = response.output_text
+    else:
+        response = client.chat.completions.create(
+            model=llm_model,
+            messages=trim_history(history, llm_model),
+            temperature=temperature,
+            top_p=top_p
+        )
+
+        ai_message = response.choices[0].message.content.strip()
+
     history.append({"role": "assistant", "content": ai_message})
 
     print(f'AI: {ai_message}')
@@ -320,10 +364,19 @@ def process_text(llm_model, temperature, top_p, text, url, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["gpt-3.5-turbo", "o1-mini", "o3-mini"]: # these models do not have vision capabilities
-       return gr.update(interactive=False)
+    if llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"]: # these models have web search capabilities
+       web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=True)
     else:
-       return gr.update(interactive=True)
+       web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=False)
+    
+    if llm_model in ["gpt-3.5-turbo", "o1-mini", "o3-mini"]: # these models do not have vision capabilities
+       image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=False)
+    else:
+       image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=True)
+
+    return web_search, image_input
+    
+
 
 def on_image_generation_model_change(image_generation_model):
     if image_generation_model == "gpt-image-1":
@@ -333,18 +386,19 @@ def on_image_generation_model_change(image_generation_model):
     else: #image_generation_model == "dall-e-2"
         return gr.update(interactive=True), gr.update(choices=["256x256", "512x512", "1024x1024"], value="1024x1024"), gr.update(interactive=False, choices=["standard"], value="standard")
 
-def on_user_input(llm_model, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
+def on_user_input(llm_model, web_search, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
     try:
         if generate_image:
             history = process_image_generation(image_generation_model, image, text, history, n_images, image_size, image_quality)
         elif image:
             history = process_image(llm_model, temperature, top_p, text, image, history)
         elif document:
-            history = process_document(llm_model, temperature, top_p, text, document, history)
+            history = process_document(llm_model, web_search, temperature, top_p, text, document, history)
         elif text:
-            history = process_text(llm_model, temperature, top_p, text, url, history)
+            history = process_text(llm_model, web_search, temperature, top_p, text, url, history)
             
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
+        web_search = gr.Checkbox(label="Web search", value=False)
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         url_input = gr.Textbox(label="Link", value=None)
@@ -354,6 +408,7 @@ def on_user_input(llm_model, temperature, top_p, text, image, document, url, his
     except Exception as exc:
         gr.Warning(str(exc.args))
         text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
+        web_search = gr.Checkbox(label="Web search", value=False)
         image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="pil", value=None)
         document_input = gr.File(label="Upload a document", type="filepath", value=None)
         url_input = gr.Textbox(label="Link", value=None)
@@ -423,6 +478,7 @@ with gr.Blocks() as demo:
                 text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
                 llm_model = gr.Dropdown(label="Model", value="gpt-4.1-mini", choices=[
                     "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5-preview", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o3", "o3-mini", "o4-mini"])
+                web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
         with gr.Column(scale=1):
@@ -441,9 +497,9 @@ with gr.Blocks() as demo:
     new_chat_button.click(on_new_chat_click, [], [chatbot, state])
     toggle_history_column_button.click(on_toggle_history_column, history_column_state, [history_column, history_column_state])
 
-    llm_model.change(on_llm_model_change, llm_model, image_input)
+    llm_model.change(on_llm_model_change, llm_model, [web_search, image_input])
     image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_generation_model, n_images, image_size, image_quality],
+    text_input.submit(on_user_input, [llm_model, web_search, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_generation_model, n_images, image_size, image_quality],
                       [state, chatbot, text_input, image_input, document_input, url_input, generate_image])
     
     history_files_list.select(select_history_file, [], history_file_name)
