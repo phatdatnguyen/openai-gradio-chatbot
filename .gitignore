@@ -2,5 +2,6 @@ __pycache__/
 .vs/
 .gradio/
 .vs/
+chatbot-env/
 history/
 api_key.py

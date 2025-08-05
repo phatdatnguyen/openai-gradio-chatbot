@@ -156,10 +156,13 @@ MODEL_TOKEN_LIMITS = {
     "chatgpt-4o-latest": 128000,
     "o1": 128000,
     "o1-mini": 128000,
+    "o1-pro": 128000,
     "o3": 200000,
     "o3-mini": 200000,
+    "o3-pro": 200000,
+    "o3-deep-research": 200000,
     "o4-mini": 200000,
-    "gpt-4.5-preview": 128000
+    "o4-mini-deep-research": 200000
 }
 
 MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
@@ -210,44 +213,28 @@ def trim_history(history, model, web_search=False, reserved_tokens=2000):
 
     return trimmed_history
 
-def process_image_generation(image_generation_model, image_path, text, history, n_images, image_size, image_quality):
+def process_image_generation(llm_model, text, history, image_size, image_quality):
     history = history or []
     history.append({"role": "user", "content": text})
 
     print(f'User: {text}')
 
     # API call
-    if image_generation_model == "gpt-image-1":
-        if image_path:
-            response = client.images.edit(image=[open(image_path, "rb"),], model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
-        else:
-            response = client.images.generate(model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
-        ai_message = "Here is the image I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            base64_image = response.data[i].b64_json
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-        history.append({"role": "assistant", "content": ai_message})
-    elif image_generation_model == "dall-e-3":
-        response = client.images.generate(model=image_generation_model, prompt=str(trim_history(history, "gpt-4-turbo")), size=image_size, quality=image_quality)
-        ai_message = "Here is the image I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            image_url = response.data[i].url
-            base64_image = encode_image_from_url(image_url)
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
-        history.append({"role": "assistant", "content": ai_message})
-    else: # image_generation_model == "dall-e-2":
-        response = client.images.generate(model=image_generation_model, prompt=text, n=n_images, size=image_size)
-        if n_images == 1:
-            ai_message = "Here is the image I generated:"
-        else:
-            ai_message = "Here are the images I generated:"
-        print(f'AI: {ai_message}')
-        for i in range(len(response.data)):
-            image_url = response.data[i].url
-            base64_image = encode_image_from_url(image_url)
-            ai_message += f"\n![Image {i + 1}](data:image/jpeg;base64,{base64_image})"
+    response = client.responses.create(
+        model=llm_model,
+        input=trim_history(history, llm_model),
+        tools=[{
+                "type": "image_generation",
+                "background": "transparent",
+                "size": image_size,
+                "quality": image_quality,
+            }]
+    )
+    image_data = [output.result for output in response.output if output.type == "image_generation_call"]
+
+    if image_data:
+        base64_image = image_data[0]
+        ai_message = response.output_text + f"\n![Image](data:image/jpeg;base64,{base64_image})"
         history.append({"role": "assistant", "content": ai_message})
         
     return history
@@ -334,8 +321,9 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
     print(f'User: {text}')
 
     # API call
-    if web_search != "None":
-        response = client.responses.create(
+    if llm_model in ["o1-pro", "o3-pro", "o3-deep-research", "o4-mini-deep-research"]: # These models use the responses API
+        if web_search != "None":
+            response = client.responses.create(
             model=llm_model,
             input=trim_history(history, llm_model, web_search=True),
             tools=[{
@@ -344,18 +332,39 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
             }],
             temperature=temperature,
             top_p=top_p
-        )
+            )
+        else:
+            response = client.responses.create(
+                model=llm_model,
+                input=trim_history(history, llm_model, web_search=True),
+                temperature=temperature,
+                top_p=top_p
+            )
 
         ai_message = response.output_text
-    else:
-        response = client.chat.completions.create(
-            model=llm_model,
-            messages=trim_history(history, llm_model),
-            temperature=temperature,
-            top_p=top_p
-        )
+    else: # These models use the responses API with web search tool or chat completions API without web search tool
+        if web_search != "None":
+            response = client.responses.create(
+                model=llm_model,
+                input=trim_history(history, llm_model, web_search=True),
+                tools=[{
+                    "type": "web_search_preview",
+                    "search_context_size": web_search,
+                }],
+                temperature=temperature,
+                top_p=top_p
+            )
 
-        ai_message = response.choices[0].message.content.strip()
+            ai_message = response.output_text
+        else:
+            response = client.chat.completions.create(
+                model=llm_model,
+                messages=trim_history(history, llm_model),
+                temperature=temperature,
+                top_p=top_p
+            )
+
+            ai_message = response.choices[0].message.content.strip()
 
     history.append({"role": "assistant", "content": ai_message})
 
@@ -364,7 +373,9 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"]: # these models have web search capabilities
+    if llm_model in ["o3-deep-research", "o4-mini-deep-research"]: # these models must use web search tool
+       web_search = gr.Dropdown(label="Web search", value="medium", choices=["low", "medium", "high"], interactive=True)
+    elif llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o3", "o3-pro"]: # these models have web search capabilities
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=True)
     else:
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=False)
@@ -374,22 +385,17 @@ def on_llm_model_change(llm_model):
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=True)
 
-    return web_search, image_input
-    
+    if llm_model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o3", "o3-pro"]: # these models have image generation capabilities
+       generate_image = gr.Checkbox(label="Generate image", value=False, interactive=True)
+    else:
+       generate_image = gr.Checkbox(label="Generate image", value=False, interactive=False)
 
+    return web_search, image_input, generate_image
 
-def on_image_generation_model_change(image_generation_model):
-    if image_generation_model == "gpt-image-1":
-        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1536x1024", "1024x1536"], value="1024x1024"), gr.update(interactive=True, choices=["auto", "low", "medium", "high"], value="auto")
-    if image_generation_model == "dall-e-3":
-        return gr.update(interactive=False), gr.update(choices=["1024x1024", "1792x1024", "1024x1792"], value="1024x1024"), gr.update(interactive=True, choices=["standard", "hd"], value="standard")
-    else: #image_generation_model == "dall-e-2"
-        return gr.update(interactive=True), gr.update(choices=["256x256", "512x512", "1024x1024"], value="1024x1024"), gr.update(interactive=False, choices=["standard"], value="standard")
-
-def on_user_input(llm_model, web_search, temperature, top_p, text, image, document, url, history, generate_image, image_generation_model, n_images, image_size, image_quality):
+def on_user_input(llm_model, web_search, temperature, top_p, text, image, document, url, history, generate_image, image_size, image_quality):
     try:
         if generate_image:
-            history = process_image_generation(image_generation_model, image, text, history, n_images, image_size, image_quality)
+            history = process_image_generation(llm_model, text, history, image_size, image_quality)
         elif image:
             history = process_image(llm_model, temperature, top_p, text, image, history)
         elif document:
@@ -477,7 +483,7 @@ with gr.Blocks() as demo:
             with gr.Accordion(label="Prompt"):
                 text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
                 llm_model = gr.Dropdown(label="Model", value="gpt-4.1-mini", choices=[
-                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5-preview", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o3", "o3-mini", "o4-mini"])
+                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini", "o4-mini-deep-research"])
                 web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
@@ -489,17 +495,14 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             with gr.Accordion(label="Image generation"):
                 generate_image = gr.Checkbox(label="Generate image", value=False)
-                image_generation_model = gr.Dropdown(label="Model", value="gpt-image-1", choices=["gpt-image-1", "dall-e-3", "dall-e-2"])
-                n_images = gr.Slider(label="Number of images", minimum=1, maximum=1, step=1, value=1, interactive=False)
-                image_size = gr.Dropdown(label="Image size", value="1024x1024", choices=["1024x1024", "1536x1024", "1024x1536"])
+                image_size = gr.Dropdown(label="Image size", value="auto", choices=["auto", "1024x1024", "1536x1024", "1024x1536"])
                 image_quality = gr.Dropdown(label="Image quality", value="auto", choices=["auto", "low", "medium", "high"])
 
     new_chat_button.click(on_new_chat_click, [], [chatbot, state])
     toggle_history_column_button.click(on_toggle_history_column, history_column_state, [history_column, history_column_state])
 
-    llm_model.change(on_llm_model_change, llm_model, [web_search, image_input])
-    image_generation_model.change(on_image_generation_model_change, image_generation_model, [n_images, image_size, image_quality])
-    text_input.submit(on_user_input, [llm_model, web_search, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_generation_model, n_images, image_size, image_quality],
+    llm_model.change(on_llm_model_change, llm_model, [web_search, image_input, generate_image])
+    text_input.submit(on_user_input, [llm_model, web_search, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_size, image_quality],
                       [state, chatbot, text_input, image_input, document_input, url_input, generate_image])
     
     history_files_list.select(select_history_file, [], history_file_name)
