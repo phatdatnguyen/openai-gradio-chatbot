@@ -17,10 +17,16 @@ This app requires OpenAI API key, register for one at [this website](https://ope
 ```
 git clone https://github.com/phatdatnguyen/openai-gradio-chatbot
 ```
-- Install the required packages:
+- Create virtual environment:
 
 ```
 cd openai-gradio-chatbot
+python -m venv chatbot-env
+chatbot-env\Scripts\activate
+```
+- Install the required packages:
+
+```
 pip install -r requirements.txt
 ```
 - Create a file name `api_key.py` and store your API key in `API_KEY` variable.

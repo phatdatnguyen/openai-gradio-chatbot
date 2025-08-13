@@ -153,7 +153,9 @@ MODEL_TOKEN_LIMITS = {
     "gpt-4.1-nano": 1047576,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
-    "chatgpt-4o-latest": 128000,
+    "gpt-5": 400000,
+    "gpt-5-mini": 400000,
+    "gpt-5-nano": 400000,
     "o1": 128000,
     "o1-mini": 128000,
     "o1-pro": 128000,
@@ -167,9 +169,14 @@ MODEL_TOKEN_LIMITS = {
 
 MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-4.1": 128000,
-    "gpt-4.1-mini": 128000,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
+    "gpt-5": 128000,
+    "gpt-5-mini": 128000,
+    "o3": 128000,
+    "o3-pro": 128000,
+    "o3-deep-research": 128000,
+    "o4-mini-deep-research": 128000
 }
 
 
@@ -375,7 +382,7 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
 def on_llm_model_change(llm_model):
     if llm_model in ["o3-deep-research", "o4-mini-deep-research"]: # these models must use web search tool
        web_search = gr.Dropdown(label="Web search", value="medium", choices=["low", "medium", "high"], interactive=True)
-    elif llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o3", "o3-pro"]: # these models have web search capabilities
+    elif llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-mini", "o3", "o3-pro"]: # these models have web search capabilities
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=True)
     else:
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=False)
@@ -385,7 +392,7 @@ def on_llm_model_change(llm_model):
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=True)
 
-    if llm_model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o3", "o3-pro"]: # these models have image generation capabilities
+    if llm_model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-nano", "o3", "o3-pro"]: # these models have image generation capabilities
        generate_image = gr.Checkbox(label="Generate image", value=False, interactive=True)
     else:
        generate_image = gr.Checkbox(label="Generate image", value=False, interactive=False)
@@ -431,7 +438,7 @@ def on_toggle_history_column(state):
 
 def get_history_file_list():
     history_file_list = []
-    for file in glob.glob('.\\history\\*.json', recursive=True):
+    for file in glob.glob('./history/*.json', recursive=True):
         history_file_list.append(os.path.splitext(os.path.basename(file))[0])
 
     return history_file_list
@@ -482,8 +489,8 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             with gr.Accordion(label="Prompt"):
                 text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
-                llm_model = gr.Dropdown(label="Model", value="gpt-4.1-mini", choices=[
-                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini", "o4-mini-deep-research"])
+                llm_model = gr.Dropdown(label="Model", value="gpt-5", choices=[
+                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini", "o4-mini-deep-research"])
                 web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
