@@ -154,8 +154,13 @@ MODEL_TOKEN_LIMITS = {
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
     "gpt-5": 400000,
+    "gpt-5-chat-latest": 128000,
+    "gpt-5-pro": 400000,
     "gpt-5-mini": 400000,
     "gpt-5-nano": 400000,
+    "gpt-5.1": 400000,
+    "gpt-5.1-codex": 400000,
+    "gpt-5.1-codex-mini": 400000,
     "o1": 128000,
     "o1-mini": 128000,
     "o1-pro": 128000,
@@ -171,8 +176,11 @@ MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-4.1": 128000,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
-    "gpt-5": 128000,
-    "gpt-5-mini": 128000,
+    "gpt-5": 400000,
+    "gpt-5-chat-latest": 128000,
+    "gpt-5-pro": 400000,
+    "gpt-5-mini": 400000,
+    "gpt-5.1": 400000,
     "o3": 128000,
     "o3-pro": 128000,
     "o3-deep-research": 128000,
@@ -328,7 +336,7 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
     print(f'User: {text}')
 
     # API call
-    if llm_model in ["o1-pro", "o3-pro", "o3-deep-research", "o4-mini-deep-research"]: # These models use the responses API
+    if llm_model in ["o1-pro", "o3-pro", "o3-deep-research", "o4-mini-deep-research", "gpt-5.1-codex", "gpt-5.1-codex-mini"]: # These models use the responses API
         if web_search != "None":
             response = client.responses.create(
             model=llm_model,
@@ -382,7 +390,7 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
 def on_llm_model_change(llm_model):
     if llm_model in ["o3-deep-research", "o4-mini-deep-research"]: # these models must use web search tool
        web_search = gr.Dropdown(label="Web search", value="medium", choices=["low", "medium", "high"], interactive=True)
-    elif llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-mini", "o3", "o3-pro"]: # these models have web search capabilities
+    elif llm_model in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5-mini", "gpt-5.1", "o3", "o3-pro"]: # these models have web search capabilities
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=True)
     else:
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=False)
@@ -392,7 +400,7 @@ def on_llm_model_change(llm_model):
     else:
        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=True)
 
-    if llm_model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-nano", "o3", "o3-pro"]: # these models have image generation capabilities
+    if llm_model in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5-nano", "gpt-5.1", "o3", "o3-pro"]: # these models have image generation capabilities
        generate_image = gr.Checkbox(label="Generate image", value=False, interactive=True)
     else:
        generate_image = gr.Checkbox(label="Generate image", value=False, interactive=False)
@@ -489,8 +497,8 @@ with gr.Blocks() as demo:
         with gr.Column(scale=1):
             with gr.Accordion(label="Prompt"):
                 text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
-                llm_model = gr.Dropdown(label="Model", value="gpt-5", choices=[
-                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-mini", "gpt-5-nano", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini", "o4-mini-deep-research"])
+                llm_model = gr.Dropdown(label="Model", value="gpt-5.1", choices=[
+                    "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "gpt-5", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "o1", "o1-mini", "o1-pro", "o3", "o3-mini", "o3-pro", "o3-deep-research", "o4-mini", "o4-mini-deep-research"])
                 web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
