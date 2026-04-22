@@ -9,3 +9,4 @@ html2text
 PyPDF2
 python-docx
 python-pptx
+Pillow

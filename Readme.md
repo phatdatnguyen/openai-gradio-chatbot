@@ -11,7 +11,7 @@
 - Save and load chat history
 
 ## Installation:
-This app requires OpenAI API key, register for one at [this website](https://openai.com/index/openai-api/).
+This app requires an OpenAI API key, register for one at [this website](https://openai.com/index/openai-api/).
 - Clone this repo: Open terminal
 
 ```
@@ -29,9 +29,17 @@ chatbot-env\Scripts\activate
 ```
 pip install -r requirements.txt
 ```
-- Create a file name `api_key.py` and store your API key in `API_KEY` variable.
+- Store your API key in either `api_key.py` or the `OPENAI_API_KEY` environment variable.
+
+Option 1: create a file named `api_key.py` and store your API key in the `API_KEY` variable:
 ```
 API_KEY = "<your API key>"
+```
+
+Option 2: set an environment variable before starting the app:
+
+```
+set OPENAI_API_KEY=<your API key>
 ```
 ## Start web UI
 To start the web UI:
