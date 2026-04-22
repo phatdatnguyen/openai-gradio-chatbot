@@ -5,3 +5,4 @@ __pycache__/
 chatbot-env/
 history/
 api_key.py
+CLAUDE.md

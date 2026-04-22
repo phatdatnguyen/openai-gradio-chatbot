@@ -46,12 +46,8 @@ def encode_image(image):
 
 def encode_image_from_url(url):
     response = requests.get(url, timeout=15)
-    response.raise_for_status()  # Raise an error for bad responses (4xx or 5xx)
-    
-    # Open the image using Pillow
+    response.raise_for_status()
     image = Image.open(io.BytesIO(response.content))
-    
-    # Encode the image
     return encode_image(image)
 
 def prepare_chat_messages(history):
@@ -87,7 +83,7 @@ def prepare_responses_input(history):
     return messages
 
 
-def process_image(llm_model, temperature, top_p, text, image_path, history):
+def process_image(llm_model, temperature, top_p, text, image_path, history, system_prompt=""):
     prompt_text = normalize_text(text)
     image = Image.open(image_path)
     base64_image = encode_image(image)
@@ -99,6 +95,8 @@ def process_image(llm_model, temperature, top_p, text, image_path, history):
     print(f'User: {prompt_text}\nImage: {image}')
 
     chat_messages = trim_history(prepare_chat_messages(history), llm_model)
+    if system_prompt:
+        chat_messages = [{"role": "system", "content": system_prompt}] + chat_messages
     response = client.chat.completions.create(
         model=llm_model,
         messages=chat_messages,
@@ -161,25 +159,22 @@ def replace_history_content(history):
     for message in history:
         content = message["content"]
 
-        # Replace document content with document file name
         pattern = r'(?s)<<<DOCUMENT_CONTENT>>>\nFile: (.*?)\n.*?<<<END_DOCUMENT>>>'
         def repl(match):
             file_name = match.group(1)
             return f'[File: {file_name}]'
         replaced_content = re.sub(pattern, repl, content)
 
-        # Replace link content with URL
         pattern = r'(?s)<<<LINK_CONTENT>>>\nURL: (.*?)\n.*?<<<END_LINK>>>'
         def repl(match):
             url = match.group(1)
             return f'[URL: {url}]'
         replaced_content = re.sub(pattern, repl, replaced_content)
 
-        # Add encoded image
         if "image_url" in message:
             image_url = message["image_url"]
             replaced_content += f'\n![Image]({image_url})'
-        
+
         replaced_message = {
                 "role": message["role"],
                 "content": replaced_content
@@ -228,6 +223,7 @@ MODEL_TOKEN_LIMITS = {
 
 MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-4.1": 128000,
+    "gpt-4.1-mini": 128000,
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
     "gpt-5": 400000,
@@ -379,18 +375,15 @@ def build_image_option_updates(image_model):
         ),
     )
 
-def on_image_model_change(image_model):
-    return build_image_option_updates(image_model)
-
 def on_image_output_format_change(image_output_format):
     compression_enabled = image_output_format in ["jpeg", "webp"]
     return gr.Slider(label="Compression", minimum=0, maximum=100, step=1, value=100, interactive=compression_enabled)
 
 def get_max_context_tokens(model_name, web_search=False):
     if web_search:
-        return MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH.get(model_name, 128000)  # Default fallback
+        return MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH.get(model_name, 128000)
     else:
-        return MODEL_TOKEN_LIMITS.get(model_name, 4096)  # Default fallback
+        return MODEL_TOKEN_LIMITS.get(model_name, 4096)
 
 def count_tokens(messages, model):
     try:
@@ -399,11 +392,10 @@ def count_tokens(messages, model):
         encoding = tiktoken.get_encoding("cl100k_base")
     num_tokens = 0
     for msg in messages:
-        # Every message has metadata overhead
-        num_tokens += 4  # for role/content/...
-        for key, value in msg.items():  
+        num_tokens += 4
+        for key, value in msg.items():
             num_tokens += len(encoding.encode(serialize_message_value(value)))
-    num_tokens += 2  # priming token overhead
+    num_tokens += 2
     return num_tokens
 
 def trim_history(history, model, web_search=False, reserved_tokens=2000):
@@ -415,11 +407,10 @@ def trim_history(history, model, web_search=False, reserved_tokens=2000):
     max_context = get_max_context_tokens(model, web_search)
     max_input_tokens = max_context - reserved_tokens
 
-    # Reverse iterate to keep most recent messages
     for message in reversed(history):
         message_tokens = count_tokens([message], model)
         if total_tokens + message_tokens <= max_input_tokens:
-            trimmed_history.insert(0, message)  # Insert at the beginning to maintain order
+            trimmed_history.insert(0, message)
             total_tokens += message_tokens
         else:
             break
@@ -479,7 +470,7 @@ def process_image_generation(text, image_path, history, image_model, image_size,
 
     return history
 
-def process_document(llm_model, web_search, temperature, top_p, text, document, history):
+def process_document(llm_model, web_search, temperature, top_p, text, document, history, system_prompt=""):
     document_text = ""
     prompt_text = normalize_text(text)
     try:
@@ -493,16 +484,16 @@ def process_document(llm_model, web_search, temperature, top_p, text, document, 
             document_text = read_excel_file(document)
         elif file_extension.lower() == ".pptx":
             document_text = read_powerpoint_file(document)
-        elif file_extension.lower() == ".htm" or file_extension.lower() == ".html":
+        elif file_extension.lower() in (".htm", ".html"):
             document_text = read_html_file(document)
         else:
             document_text = read_text_file(document)
 
         document_text = f"<<<DOCUMENT_CONTENT>>>\nFile: {file_name}\n{document_text}\n<<<END_DOCUMENT>>>"
     except Exception as exc:
-        gr.Warning("Cannot read this file!\n" + str(exc.args))
+        gr.Warning("Cannot read this file!\n" + str(exc))
         return history or []
-    
+
     if document_text:
         history = history or []
         parts = [part for part in [prompt_text, document_text] if part]
@@ -513,46 +504,48 @@ def process_document(llm_model, web_search, temperature, top_p, text, document, 
         gr.Warning("The uploaded document appears to be empty.")
         return history or []
 
-    # API call
+    responses_kwargs = {}
+    if system_prompt:
+        responses_kwargs["instructions"] = system_prompt
+
     if web_search != "None":
         response = client.responses.create(
             model=llm_model,
             input=trim_history(prepare_responses_input(history), llm_model, web_search=True),
-            tools=[{
-                "type": "web_search_preview",
-                "search_context_size": web_search,
-            }],
+            tools=[{"type": "web_search_preview", "search_context_size": web_search}],
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            **responses_kwargs,
         )
-
         ai_message = response.output_text
     elif llm_model in RESPONSES_API_MODELS:
         response = client.responses.create(
             model=llm_model,
             input=trim_history(prepare_responses_input(history), llm_model),
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            **responses_kwargs,
         )
-
         ai_message = response.output_text
     else:
+        messages = trim_history(prepare_chat_messages(history), llm_model)
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
         response = client.chat.completions.create(
             model=llm_model,
-            messages=trim_history(prepare_chat_messages(history), llm_model),
+            messages=messages,
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
         )
-
         ai_message = response.choices[0].message.content.strip()
-        
+
     history.append({"role": "assistant", "content": ai_message})
 
     print(f'AI: {ai_message}')
 
     return history
 
-def process_text(llm_model, web_search, temperature, top_p, text, url, history):
+def process_text(llm_model, web_search, temperature, top_p, text, url, history, system_prompt=""):
     history = history or []
     prompt_text = normalize_text(text)
     link_text = ""
@@ -579,51 +572,40 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
 
     print(f'User: {combined_text}')
 
-    # API call
-    if llm_model in RESPONSES_API_MODELS: # These models use the responses API
-        if web_search != "None":
-            response = client.responses.create(
+    responses_kwargs = {}
+    if system_prompt:
+        responses_kwargs["instructions"] = system_prompt
+
+    if web_search != "None":
+        response = client.responses.create(
             model=llm_model,
             input=trim_history(prepare_responses_input(history), llm_model, web_search=True),
-            tools=[{
-                "type": "web_search_preview",
-                "search_context_size": web_search,
-            }],
+            tools=[{"type": "web_search_preview", "search_context_size": web_search}],
             temperature=temperature,
-            top_p=top_p
-            )
-        else:
-            response = client.responses.create(
-                model=llm_model,
-                input=trim_history(prepare_responses_input(history), llm_model),
-                temperature=temperature,
-                top_p=top_p
-            )
-
+            top_p=top_p,
+            **responses_kwargs,
+        )
         ai_message = response.output_text
-    else: # These models use the responses API with web search tool or chat completions API without web search tool
-        if web_search != "None":
-            response = client.responses.create(
-                model=llm_model,
-                input=trim_history(prepare_responses_input(history), llm_model, web_search=True),
-                tools=[{
-                    "type": "web_search_preview",
-                    "search_context_size": web_search,
-                }],
-                temperature=temperature,
-                top_p=top_p
-            )
-
-            ai_message = response.output_text
-        else:
-            response = client.chat.completions.create(
-                model=llm_model,
-                messages=trim_history(prepare_chat_messages(history), llm_model),
-                temperature=temperature,
-                top_p=top_p
-            )
-
-            ai_message = response.choices[0].message.content.strip()
+    elif llm_model in RESPONSES_API_MODELS:
+        response = client.responses.create(
+            model=llm_model,
+            input=trim_history(prepare_responses_input(history), llm_model),
+            temperature=temperature,
+            top_p=top_p,
+            **responses_kwargs,
+        )
+        ai_message = response.output_text
+    else:
+        messages = trim_history(prepare_chat_messages(history), llm_model)
+        if system_prompt:
+            messages = [{"role": "system", "content": system_prompt}] + messages
+        response = client.chat.completions.create(
+            model=llm_model,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        ai_message = response.choices[0].message.content.strip()
 
     history.append({"role": "assistant", "content": ai_message})
 
@@ -632,69 +614,57 @@ def process_text(llm_model, web_search, temperature, top_p, text, url, history):
     return history
 
 def on_llm_model_change(llm_model):
-    if llm_model in ["o3-deep-research", "o4-mini-deep-research"]: # these models must use web search tool
+    if llm_model in ["o3-deep-research", "o4-mini-deep-research"]:
        web_search = gr.Dropdown(label="Web search", value="medium", choices=["low", "medium", "high"], interactive=True)
-    elif llm_model in WEB_SEARCH_MODELS: # these models have web search capabilities
+    elif llm_model in WEB_SEARCH_MODELS:
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=True)
     else:
        web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"], interactive=False)
-    
+
     image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", interactive=True)
     generate_image = gr.Checkbox(label="Generate or edit image", value=False, interactive=True)
 
     return web_search, image_input, generate_image
 
-def on_user_input(llm_model, web_search, temperature, top_p, text, image, document, url, history, generate_image, image_model, image_size, image_quality, image_background, image_output_format, image_output_compression, image_moderation, image_input_fidelity):
+def make_reset_inputs():
+    return (
+        gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None),
+        gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", value=None),
+        gr.File(label="Upload a document", type="filepath", value=None),
+        gr.Textbox(label="Link", value=None),
+        gr.Checkbox(label="Generate or edit image", value=False),
+    )
+
+def on_user_input(llm_model, web_search, temperature, top_p, text, image, document, url, history, generate_image, system_prompt, image_model, image_size, image_quality, image_background, image_output_format, image_output_compression, image_moderation, image_input_fidelity):
+    history = history or []
     try:
         if generate_image:
             history = process_image_generation(
-                text,
-                image,
-                history,
-                image_model,
-                image_size,
-                image_quality,
-                image_background,
-                image_output_format,
-                image_output_compression,
-                image_moderation,
-                image_input_fidelity,
+                text, image, history, image_model, image_size, image_quality,
+                image_background, image_output_format, image_output_compression,
+                image_moderation, image_input_fidelity,
             )
         elif image:
             if llm_model in VISION_DISABLED_MODELS:
                 gr.Warning("The selected chat model does not support image analysis. Enable image generation to edit the image, or choose a vision-capable chat model.")
             else:
-                history = process_image(llm_model, temperature, top_p, text, image, history)
+                history = process_image(llm_model, temperature, top_p, text, image, history, system_prompt)
         elif document:
-            history = process_document(llm_model, web_search, temperature, top_p, text, document, history)
-        elif text:
-            history = process_text(llm_model, web_search, temperature, top_p, text, url, history)
-        elif url:
-            history = process_text(llm_model, web_search, temperature, top_p, text, url, history)
-            
-        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
-        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", value=None)
-        document_input = gr.File(label="Upload a document", type="filepath", value=None)
-        url_input = gr.Textbox(label="Link", value=None)
-        generate_image = gr.Checkbox(label="Generate or edit image", value=False)
-        replaced_history = replace_history_content(history)
-        return history, replaced_history, text_input, image_input, document_input, url_input, generate_image
+            history = process_document(llm_model, web_search, temperature, top_p, text, document, history, system_prompt)
+        elif text or url:
+            history = process_text(llm_model, web_search, temperature, top_p, text, url, history, system_prompt)
     except Exception as exc:
-        gr.Warning(str(exc.args))
-        text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, value=None)
-        image_input = gr.Image(label="Upload an image", sources=["upload", "clipboard"], type="filepath", value=None)
-        document_input = gr.File(label="Upload a document", type="filepath", value=None)
-        url_input = gr.Textbox(label="Link", value=None)
-        generate_image = gr.Checkbox(label="Generate or edit image", value=False)
-        replaced_history = replace_history_content(history)
-        return history, replaced_history, text_input, image_input, document_input, url_input, generate_image
+        gr.Warning(str(exc))
+
+    replaced_history = replace_history_content(history)
+    return (history, replaced_history) + make_reset_inputs()
 
 def on_new_chat_click():
     return [], []
 
 def on_toggle_history_column(state):
     state = not state
-    return gr.update(visible = state), state
+    return gr.update(visible=state), state
 
 def get_history_file_list():
     history_file_list = []
@@ -721,7 +691,7 @@ def save_history(history, history_file_name):
     try:
         if not history:
             raise Exception("No history")
-        
+
         os.makedirs("history", exist_ok=True)
         safe_history_file_name = sanitize_history_file_name(history_file_name)
         with open(f"./history/{safe_history_file_name}.json", "w", encoding='utf8') as file:
@@ -743,7 +713,7 @@ def load_history(history_file_name):
 with gr.Blocks() as demo:
     with gr.Row(equal_height=True):
         with gr.Column(scale=4):
-            chatbot = gr.Chatbot(buttons=["copy"])
+            chatbot = gr.Chatbot(buttons=["copy"], min_height=800)
             state = gr.State([])
             history_column_state = gr.State(True)
             with gr.Row(equal_height=True):
@@ -759,7 +729,10 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column(scale=1):
             with gr.Accordion(label="Prompt"):
-                text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True)
+                with gr.Row(equal_height=True):
+                    text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, scale=4)
+                    send_button = gr.Button(value="Send", variant="primary", scale=1, min_width=80)
+                system_prompt = gr.Textbox(label="System prompt", placeholder="Optional instructions for the AI...", lines=2)
                 llm_model = gr.Dropdown(label="Model", value="gpt-5.4", choices=MODEL_CHOICES)
                 web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
@@ -788,15 +761,18 @@ with gr.Blocks() as demo:
                     interactive=default_image_config["input_fidelity_interactive"],
                 )
 
+    user_input_inputs = [llm_model, web_search, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, system_prompt, image_model, image_size, image_quality, image_background, image_output_format, image_output_compression, image_moderation, image_input_fidelity]
+    user_input_outputs = [state, chatbot, text_input, image_input, document_input, url_input, generate_image]
+
     new_chat_button.click(on_new_chat_click, [], [chatbot, state])
     toggle_history_column_button.click(on_toggle_history_column, history_column_state, [history_column, history_column_state])
 
     llm_model.change(on_llm_model_change, llm_model, [web_search, image_input, generate_image])
-    image_model.change(on_image_model_change, image_model, [image_size, image_quality, image_background, image_input_fidelity])
+    image_model.change(build_image_option_updates, image_model, [image_size, image_quality, image_background, image_input_fidelity])
     image_output_format.change(on_image_output_format_change, image_output_format, image_output_compression)
-    text_input.submit(on_user_input, [llm_model, web_search, temperature, top_p, text_input, image_input, document_input, url_input, state, generate_image, image_model, image_size, image_quality, image_background, image_output_format, image_output_compression, image_moderation, image_input_fidelity],
-                      [state, chatbot, text_input, image_input, document_input, url_input, generate_image])
-    
+    text_input.submit(on_user_input, user_input_inputs, user_input_outputs)
+    send_button.click(on_user_input, user_input_inputs, user_input_outputs)
+
     history_files_list.select(select_history_file, [], history_file_name)
     load_button.click(load_history, history_file_name, [state, chatbot, load_status])
     save_button.click(save_history, [state, history_file_name], [save_status, history_files_list])
