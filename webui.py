@@ -210,6 +210,8 @@ MODEL_TOKEN_LIMITS = {
     "gpt-5.4-nano": 400000,
     "gpt-5.4-mini": 400000,
     "gpt-5.4-pro": 1050000,
+    "gpt-5.5": 1050000,
+    "gpt-5.5-pro": 1050000,
     "o1": 128000,
     "o1-mini": 128000,
     "o1-pro": 128000,
@@ -237,6 +239,8 @@ MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-5.4-nano": 400000,
     "gpt-5.4-mini": 400000,
     "gpt-5.4-pro": 1050000,
+    "gpt-5.5": 1050000,
+    "gpt-5.5-pro": 1050000,
     "o1": 128000,
     "o3": 128000,
     "o3-pro": 128000,
@@ -252,7 +256,9 @@ MODEL_MAX_OUTPUT_TOKENS = {
     "gpt-5.4": 128000,
     "gpt-5.4-nano": 128000,
     "gpt-5.4-mini": 128000,
-    "gpt-5.4-pro": 128000
+    "gpt-5.4-pro": 128000,
+    "gpt-5.5": 128000,
+    "gpt-5.5-pro": 128000
 }
 
 RESPONSES_API_MODELS = {
@@ -264,7 +270,8 @@ RESPONSES_API_MODELS = {
     "gpt-5.1-codex-max",
     "gpt-5.1-codex-mini",
     "gpt-5.2-codex",
-    "gpt-5.3-codex"
+    "gpt-5.3-codex",
+    "gpt-5.5-pro"
 }
 
 WEB_SEARCH_MODELS = {
@@ -283,6 +290,8 @@ WEB_SEARCH_MODELS = {
     "gpt-5.4-nano",
     "gpt-5.4-mini",
     "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
     "o3",
     "o3-pro"
 }
@@ -345,6 +354,8 @@ MODEL_CHOICES = [
     "gpt-5.4-nano",
     "gpt-5.4-mini",
     "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
     "o1",
     "o1-mini",
     "o1-pro",
@@ -733,7 +744,7 @@ with gr.Blocks() as demo:
                     text_input = gr.Textbox(label="Message", placeholder="Type a message or question...", autofocus=True, scale=4)
                     send_button = gr.Button(value="Send", variant="primary", scale=1, min_width=80)
                 system_prompt = gr.Textbox(label="System prompt", placeholder="Optional instructions for the AI...", lines=2)
-                llm_model = gr.Dropdown(label="Model", value="gpt-5.4", choices=MODEL_CHOICES)
+                llm_model = gr.Dropdown(label="Model", value="gpt-5.5", choices=MODEL_CHOICES)
                 web_search = gr.Dropdown(label="Web search", value="None", choices=["None", "low", "medium", "high"])
                 temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.01, value=1)
                 top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01, value=1)
