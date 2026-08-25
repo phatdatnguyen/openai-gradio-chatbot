@@ -5,10 +5,13 @@
 
 ## Features:
 - Select different OpenAI models
+- Streaming responses, with a Stop button
+- Reasoning effort control for the o-series and GPT-5 models
+- Web search
 - Image analysis
-- Document analysis (PDF, MS Word, MS Excel, MS PowerPoint, text files)
-- Image generation
-- Save and load chat history
+- Document analysis (PDF, MS Word, MS Excel, MS PowerPoint, HTML, text files)
+- Image generation and editing
+- Save, load and delete chat history
 
 ## Installation:
 This app requires an OpenAI API key, register for one at [this website](https://openai.com/index/openai-api/).
@@ -44,3 +47,9 @@ set OPENAI_API_KEY=<your API key>
 ## Start web UI
 To start the web UI:
 - Run `start_webui.bat`
+
+## Running the tests
+```
+pip install -r requirements-dev.txt
+pytest -q
+```

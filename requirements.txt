@@ -6,7 +6,8 @@ openai
 tiktoken
 urllib3
 html2text
-PyPDF2
+pypdf
 python-docx
 python-pptx
+openpyxl
 Pillow
