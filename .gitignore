@@ -4,5 +4,9 @@ __pycache__/
 .vs/
 chatbot-env/
 history/
+
 api_key.py
 CLAUDE.md
+*.txt
+!requirements.txt
+!requirements-dev.txt
