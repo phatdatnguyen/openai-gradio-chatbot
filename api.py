@@ -7,6 +7,7 @@ through ``_build_call()``, so a capability fix lands in exactly one place.
 """
 
 import os
+from email.message import Message
 
 import requests
 
@@ -31,6 +32,7 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 )
 URL_FETCH_TIMEOUT_SECONDS = 15
+MAX_URL_BYTES = 10 * 1024 * 1024
 
 CHAT_SURFACE = "chat"
 RESPONSES_SURFACE = "responses"
@@ -42,12 +44,32 @@ class ApiKeyMissingError(RuntimeError):
 
 def fetch_url_text(url):
     """Fetch a page and convert it to markdown-ish text."""
-    response = requests.get(
-        url, headers={"User-Agent": BROWSER_USER_AGENT}, timeout=URL_FETCH_TIMEOUT_SECONDS
-    )
-    response.raise_for_status()
-    response.encoding = response.encoding or "utf-8"
-    return html2text.html2text(response.text)
+    with requests.get(
+        url, headers={"User-Agent": BROWSER_USER_AGENT},
+        timeout=URL_FETCH_TIMEOUT_SECONDS, stream=True,
+    ) as response:
+        response.raise_for_status()
+        # Bound decompressed bytes too, including responses without Content-Length.
+        body = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            body.extend(chunk)
+            if len(body) > MAX_URL_BYTES:
+                raise ValueError("The linked page exceeds the 10 MB download limit.")
+        content_type = Message()
+        content_type["Content-Type"] = response.headers.get("Content-Type", "")
+        # Requests assumes Latin-1 for HTML without a charset, corrupting UTF-8.
+        charset = content_type.get_content_charset()
+        encoding = charset or "utf-8"
+        try:
+            page = body.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            # Honor older pages without a charset, and tolerate malformed headers.
+            fallback = response.encoding if not charset else "utf-8"
+            try:
+                page = body.decode(fallback or "utf-8", errors="replace")
+            except LookupError:
+                page = body.decode("utf-8", errors="replace")
+        return html2text.html2text(page)
 
 
 def build_user_message(prompt_text, image_path=None, document_path=None, url=None):
@@ -72,7 +94,7 @@ def build_user_message(prompt_text, image_path=None, document_path=None, url=Non
     return message
 
 
-def _fold_system_prompt_into_first_user_message(messages, system_prompt):
+def _fold_system_prompt_into_first_user_message(messages, system_prompt, text_type="text"):
     """For o1-mini / o3-mini, which reject system messages entirely.
 
     Prepending the instructions to the first user turn keeps the user's intent
@@ -85,7 +107,7 @@ def _fold_system_prompt_into_first_user_message(messages, system_prompt):
             if isinstance(content, str):
                 message["content"] = f"{system_prompt}\n\n{content}"
             elif isinstance(content, list):
-                content.insert(0, {"type": "text", "text": system_prompt})
+                message["content"] = [{"type": text_type, "text": system_prompt}, *content]
             return folded
     return [{"role": "user", "content": system_prompt}] + folded
 
@@ -94,11 +116,24 @@ def _build_call(llm_model, history, web_search, temperature, top_p, system_promp
                 reasoning_effort):
     """Decide the API surface and build its kwargs. Returns ``(surface, kwargs)``."""
     system_prompt = normalize_text(system_prompt)
+    if not config.supports_vision(llm_model) and any(
+        message.get("role") == "user" and message.get("image_url")
+        for message in history or []
+    ):
+        raise ValueError(
+            f"{llm_model} cannot read images already in this conversation. "
+            "Choose a vision-capable model or start a new chat."
+        )
     use_search = bool(web_search) and web_search != config.WEB_SEARCH_OFF
+    if config.requires_web_search(llm_model) and not use_search:
+        web_search = "medium"
+        use_search = True
 
     if use_search and not config.supports_web_search(llm_model):
         logger.warning("%s does not support web search; ignoring it.", llm_model)
         use_search = False
+    if use_search and web_search not in config.WEB_SEARCH_CONTEXT_CHOICES:
+        raise ValueError("Web search context must be low, medium, or high.")
 
     # Web search is only exposed through the Responses API, so it forces that surface.
     use_responses = use_search or config.uses_responses_api(llm_model)
@@ -114,6 +149,8 @@ def _build_call(llm_model, history, web_search, temperature, top_p, system_promp
 
     effort = reasoning_effort
     if effort and effort != config.NO_REASONING_EFFORT and config.is_reasoning_model(llm_model):
+        if effort not in config.reasoning_effort_choices(llm_model):
+            raise ValueError(f"{llm_model} does not support reasoning effort {effort!r}.")
         if surface == RESPONSES_SURFACE:
             kwargs["reasoning"] = {"effort": effort}
         else:
@@ -121,14 +158,16 @@ def _build_call(llm_model, history, web_search, temperature, top_p, system_promp
 
     if surface == RESPONSES_SURFACE:
         payload = prepare_responses_input(history)
-        if system_prompt and not config.supports_system_message(llm_model):
-            payload = _fold_system_prompt_into_first_user_message(payload, system_prompt)
-            system_prompt = ""
         kwargs["input"] = trim_history(
             payload, llm_model, web_search=use_search, system_prompt=system_prompt
         )
         if system_prompt:
-            kwargs["instructions"] = system_prompt
+            if config.supports_system_message(llm_model):
+                kwargs["instructions"] = system_prompt
+            else:
+                kwargs["input"] = _fold_system_prompt_into_first_user_message(
+                    kwargs["input"], system_prompt, text_type="input_text"
+                )
         if use_search:
             kwargs["tools"] = [{
                 "type": config.WEB_SEARCH_TOOL_TYPE,
@@ -151,6 +190,44 @@ def _build_call(llm_model, history, web_search, temperature, top_p, system_promp
     return surface, kwargs
 
 
+def _check_response_status(response):
+    """HTTP 200 can still contain a failed or incomplete model response."""
+    status = getattr(response, "status", None)
+    if status == "failed":
+        error = getattr(response, "error", None)
+        raise RuntimeError(getattr(error, "message", None) or "The model response failed.")
+    if status == "incomplete":
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None) or "unknown reason"
+        raise RuntimeError(f"The model response was incomplete ({reason}). Please try again.")
+
+
+def _require_reply(text):
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("The model returned an empty response.")
+    return text
+
+
+def _response_text(response):
+    _check_response_status(response)
+    parts = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in item.content:
+            if part.type == "output_text":
+                parts.append(part.text)
+            elif part.type == "refusal":
+                parts.append(part.refusal)
+    return _require_reply("".join(parts) or getattr(response, "output_text", None))
+
+
+def _check_chat_finish(reason):
+    if reason in ("length", "content_filter"):
+        raise RuntimeError(f"The model response was incomplete ({reason}). Please try again.")
+
+
 def send_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperature=1.0,
               top_p=1.0, system_prompt="", reasoning_effort=None):
     """Blocking call. Returns the assistant's reply text."""
@@ -161,15 +238,24 @@ def send_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperature=
 
     if surface == RESPONSES_SURFACE:
         response = client.responses.create(**kwargs)
-        return (response.output_text or "").strip()
+        return _response_text(response)
 
     response = client.chat.completions.create(**kwargs)
-    return (response.choices[0].message.content or "").strip()
+    if not response.choices:
+        return _require_reply("")
+    choice = response.choices[0]
+    _check_chat_finish(choice.finish_reason)
+    return _require_reply(choice.message.content or getattr(choice.message, "refusal", None))
 
 
 def stream_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperature=1.0,
                 top_p=1.0, system_prompt="", reasoning_effort=None):
     """Streaming call. Yields text deltas as they arrive."""
+    if not config.supports_streaming(llm_model):
+        logger.info("%s does not support streaming; waiting for its full reply.", llm_model)
+        yield send_chat(llm_model, history, web_search, temperature, top_p,
+                        system_prompt, reasoning_effort)
+        return
     surface, kwargs = _build_call(
         llm_model, history, web_search, temperature, top_p, system_prompt, reasoning_effort
     )
@@ -177,21 +263,43 @@ def stream_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperatur
 
     if surface == RESPONSES_SURFACE:
         with client.responses.stream(**kwargs) as stream:
+            has_text = False
             for event in stream:
-                if getattr(event, "type", None) == "response.output_text.delta":
+                event_type = getattr(event, "type", None)
+                if event_type in ("response.output_text.delta", "response.refusal.delta"):
                     delta = getattr(event, "delta", None)
                     if delta:
+                        has_text = has_text or bool(delta.strip())
                         yield delta
+                elif event_type == "error":
+                    raise RuntimeError(getattr(event, "message", None) or "The response stream failed.")
+                elif event_type in ("response.failed", "response.incomplete"):
+                    _check_response_status(event.response)
+            response = stream.get_final_response()
+            _check_response_status(response)
+            if not has_text:
+                yield _response_text(response)
         return
 
-    stream = client.chat.completions.create(stream=True, **kwargs)
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        text = getattr(delta, "content", None)
-        if text:
-            yield text
+    with client.chat.completions.create(stream=True, **kwargs) as stream:
+        has_text = False
+        finished = False
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            _check_chat_finish(choice.finish_reason)
+            if choice.finish_reason is not None:
+                finished = True
+            delta = choice.delta
+            text = getattr(delta, "content", None) or getattr(delta, "refusal", None)
+            if text:
+                has_text = has_text or bool(text.strip())
+                yield text
+        if not finished:
+            raise RuntimeError("The response stream ended before the model finished. Please try again.")
+        if not has_text:
+            _require_reply("")
 
 
 def generate_image(prompt_text, image_path, image_model, image_size, image_quality,

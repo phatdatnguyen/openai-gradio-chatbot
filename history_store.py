@@ -8,10 +8,12 @@ so existing saved chats keep working untouched.
 
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
 import shutil
+import tempfile
 
 from log import logger
 from messages import is_data_url, normalize_text
@@ -22,6 +24,7 @@ DEFAULT_HISTORY_NAME = "Chat history"
 MAX_HISTORY_NAME_LENGTH = 100
 
 _UNSAFE_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_DEVICE_NAME = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", re.IGNORECASE)
 _DATA_URL_HEADER = re.compile(r"^data:image/([a-zA-Z0-9.+-]+);base64,")
 
 # Generated images arrive as markdown embedded in the assistant's content
@@ -29,7 +32,10 @@ _DATA_URL_HEADER = re.compile(r"^data:image/([a-zA-Z0-9.+-]+);base64,")
 # chat's size actually comes from -- not the image_url field.
 _CONTENT_DATA_URL = re.compile(r"data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)")
 _ASSET_REFERENCE = re.compile(
-    r"assets/[^\s)\"']+\.(?:png|jpg|jpeg|webp|gif)", re.IGNORECASE
+    # History names can contain spaces and parentheses. The final component is
+    # an image filename; stop there rather than at the first space in the name.
+    r"(?<![\w/:\\])assets/[^/\\\r\n]+/[^/\\\s)\"']+\.(?:png|jpg|jpeg|webp|gif)(?![\w.])",
+    re.IGNORECASE,
 )
 IMAGE_EXTENSION_ALIASES = {"jpeg": "jpg"}
 
@@ -39,8 +45,10 @@ def sanitize_history_file_name(history_file_name):
         history_file_name = history_file_name.value
     sanitized = _UNSAFE_NAME_CHARS.sub("_", normalize_text(history_file_name))
     # Strip leading dots so a name like ".." cannot escape the history directory.
-    sanitized = sanitized.lstrip(".").strip()
-    return sanitized[:MAX_HISTORY_NAME_LENGTH] or DEFAULT_HISTORY_NAME
+    sanitized = sanitized.strip().lstrip(".").rstrip(". ")
+    if _WINDOWS_DEVICE_NAME.match(sanitized):
+        sanitized = "_" + sanitized
+    return sanitized[:MAX_HISTORY_NAME_LENGTH].rstrip(". ") or DEFAULT_HISTORY_NAME
 
 
 def history_file_path(safe_name):
@@ -70,10 +78,36 @@ def _split_data_url(data_url):
 
 def _write_asset(target_dir, safe_name, file_name, payload):
     """Decode and write one image, returning its history-relative reference."""
+    image_bytes = base64.b64decode(payload, validate=True)
     os.makedirs(target_dir, exist_ok=True)
-    with open(os.path.join(target_dir, file_name), "wb") as image_file:
-        image_file.write(base64.b64decode(payload))
-    return f"{ASSETS_DIR_NAME}/{safe_name}/{file_name}"
+    stem, extension = os.path.splitext(file_name)
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    candidate = file_name
+    suffix = 0
+    while True:
+        path = os.path.join(target_dir, candidate)
+        try:
+            image_file = open(path, "xb")
+        except FileExistsError:
+            with open(path, "rb") as existing:
+                if existing.read() == image_bytes:
+                    return f"{ASSETS_DIR_NAME}/{safe_name}/{candidate}"
+            # Existing assets may still belong to the last successfully saved
+            # JSON. Never overwrite them before the replacement JSON commits.
+            extra = f"-{suffix}" if suffix else ""
+            candidate = f"{stem}-{digest}{extra}{extension}"
+            suffix += 1
+            continue
+        try:
+            with image_file:
+                image_file.write(image_bytes)
+        except OSError:
+            try:
+                os.remove(path)
+            except OSError as exc:
+                logger.warning("Could not remove incomplete history asset: %s", exc)
+            raise
+        return f"{ASSETS_DIR_NAME}/{safe_name}/{candidate}"
 
 
 def _externalize_images(history, safe_name):
@@ -131,7 +165,21 @@ def _externalize_images(history, safe_name):
 
 def _read_asset_as_data_url(reference):
     """Read a history-relative asset path back into a data URL, or None if missing."""
-    asset_path = os.path.join(HISTORY_DIR, reference.replace("/", os.sep))
+    # History JSON is editable. Never let a stored image reference read arbitrary
+    # files, including through an absolute path, '..', or a symlink in assets.
+    normalized = reference.replace("\\", "/")
+    if not normalized.startswith(f"{ASSETS_DIR_NAME}/") or ":" in normalized:
+        logger.warning("Ignoring invalid history asset reference")
+        return None
+    asset_root = os.path.realpath(os.path.join(HISTORY_DIR, ASSETS_DIR_NAME))
+    asset_path = os.path.realpath(os.path.join(HISTORY_DIR, normalized.replace("/", os.sep)))
+    try:
+        contained = os.path.commonpath([asset_root, asset_path]) == asset_root
+    except ValueError:
+        contained = False
+    if not contained or asset_path == asset_root:
+        logger.warning("Ignoring history asset outside the assets directory")
+        return None
     try:
         with open(asset_path, "rb") as image_file:
             payload = base64.b64encode(image_file.read()).decode("utf-8")
@@ -155,7 +203,7 @@ def _inline_images(history):
         message = dict(message)
 
         image_url = message.get("image_url")
-        if image_url and not is_data_url(image_url):
+        if image_url and not is_data_url(image_url) and not image_url.startswith(("https://", "http://")):
             data_url = _read_asset_as_data_url(image_url)
             if data_url:
                 message["image_url"] = data_url
@@ -183,8 +231,21 @@ def save_history(history, history_file_name):
 
     stored = _externalize_images(history, safe_name)
     path = history_file_path(safe_name)
-    with open(path, "w", encoding="utf8") as file:
-        json.dump(stored, file, indent=4, ensure_ascii=False)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf8", dir=HISTORY_DIR,
+            prefix=".history-", suffix=".tmp", delete=False,
+        ) as file:
+            temporary_path = file.name
+            json.dump(stored, file, indent=4, ensure_ascii=False)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError as exc:
+                logger.warning("Could not remove temporary history file: %s", exc)
 
     size_kb = os.path.getsize(path) / 1024
     logger.info("Saved %s (%.1f KB)", path, size_kb)
@@ -200,6 +261,15 @@ def load_history(history_file_name):
 
     if not isinstance(history, list):
         raise ValueError(f"{safe_name}.json does not contain a chat history.")
+
+    for index, message in enumerate(history, start=1):
+        if (
+            not isinstance(message, dict)
+            or message.get("role", "user") not in ("user", "assistant", "system", "developer")
+            or not isinstance(message.get("content", ""), str)
+            or not isinstance(message.get("image_url", ""), (str, type(None)))
+        ):
+            raise ValueError(f"{safe_name}.json contains an invalid message at position {index}.")
 
     history = _inline_images(history)
     logger.info("Loaded %s (%d messages)", path, len(history))

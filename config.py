@@ -7,6 +7,7 @@ tables kept drifting out of sync as models were added one commit at a time --
 """
 
 import os
+from math import ceil, floor
 
 from openai import OpenAI
 
@@ -74,6 +75,7 @@ MODEL_TOKEN_LIMITS = {
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-sol": 1050000,
+    "gpt-6-astra": 1050000,
     "o1": 128000,
     "o1-mini": 128000,
     "o1-pro": 128000,
@@ -106,6 +108,7 @@ MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-5.6-luna": 128000,
     "gpt-5.6-terra": 128000,
     "gpt-5.6-sol": 128000,
+    "gpt-6-astra": 128000,
     "o1": 128000,
     "o3": 128000,
     "o3-pro": 128000,
@@ -128,6 +131,7 @@ MODEL_MAX_OUTPUT_TOKENS = {
     "gpt-5.6-luna": 128000,
     "gpt-5.6-terra": 128000,
     "gpt-5.6-sol": 128000,
+    "gpt-6-astra": 128000,
 }
 
 # Models only reachable through client.responses.*, never chat.completions.
@@ -148,6 +152,10 @@ RESPONSES_API_MODELS = {
     "gpt-5.4-pro",
     "gpt-5.5-pro",
 }
+
+# These models need a blocking response even when the UI requests streaming.
+# See the Features section of each model's official API documentation.
+NON_STREAMING_MODELS = {"o1-pro", "o3-pro", "gpt-5.5-pro"}
 
 WEB_SEARCH_MODELS = {
     "gpt-4.1",
@@ -170,6 +178,7 @@ WEB_SEARCH_MODELS = {
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-6-astra",
     "o3",
     "o3-pro",
 }
@@ -188,6 +197,52 @@ WEB_SEARCH_OFF = "None"
 # raw API error instead of a friendly warning.
 VISION_DISABLED_MODELS = {"gpt-3.5-turbo", "gpt-4", "o1-mini", "o3-mini"}
 
+# Conservative per-image context budgets, independent of PNG/JPEG compression.
+# Source: https://developers.openai.com/api/docs/guides/images-vision
+# Tile images fit within 2048px and have a shortest side at most 768px, so no
+# more than 4 * 2 tiles are needed. Values are (base tokens, tokens per tile).
+IMAGE_TILE_TOKEN_COSTS = {
+    "gpt-4o": (85, 170),
+    "gpt-4o-mini": (2833, 5667),
+    "gpt-4.1": (85, 170),
+    "gpt-5": (70, 140),
+    "gpt-5.1": (70, 140),
+    "o1": (75, 150),
+    "o1-pro": (75, 150),
+    "o3": (75, 150),
+}
+
+# Bounds use the documented patch budgets multiplied by each model's rate,
+# rounded up. They intentionally reserve the maximum for the selected detail;
+# small images generally use fewer tokens. auto differs between model families.
+IMAGE_PATCH_TOKEN_BUDGETS = {
+    "gpt-4.1-mini": {"low": 9954, "high": 9954, "auto": 9954},
+    "gpt-5.2": {"low": 7373, "high": 7373, "auto": 7373},
+    "gpt-5.4": {"low": 7373, "high": 3000, "original": 12000, "auto": 3000},
+    "gpt-5.4-mini": {"low": 7373, "high": 3000, "original": 12000, "auto": 3000},
+    "gpt-5.4-nano": {"low": 7373, "high": 3000, "original": 12000, "auto": 3000},
+    "gpt-5.5": {"low": 308, "high": 3000, "original": 12000, "auto": 12000},
+    "gpt-5.6-sol": {"low": 308, "high": 3000, "original": 36000, "auto": 36000},
+    "gpt-5.6-terra": {"low": 308, "high": 3000, "original": 36000, "auto": 36000},
+    "gpt-5.6-luna": {"low": 308, "high": 3000, "original": 36000, "auto": 36000},
+}
+IMAGE_PATCH_TOKEN_MULTIPLIERS = {
+    "gpt-4.1-mini": 1.62,
+    "gpt-5.2": 1.2,
+    "gpt-5.4": 1.2,
+    "gpt-5.4-mini": 1.2,
+    "gpt-5.4-nano": 1.2,
+    "gpt-5.5": 1.2,
+    "gpt-5.6-sol": 1.2,
+    "gpt-5.6-terra": 1.2,
+    "gpt-5.6-luna": 1.2,
+}
+
+# For variants without documented sizing rules, use the largest documented
+# patch cap (30,000) times the largest listed multiplier (2.46). This is a
+# conservative fallback estimate, not a documented guarantee for unknown models.
+DEFAULT_IMAGE_TOKEN_BUDGET = 73800
+
 # Reasoning models that reject system/developer messages outright.
 SYSTEM_MESSAGE_UNSUPPORTED_MODELS = {"o1-mini", "o3-mini"}
 
@@ -195,7 +250,7 @@ SYSTEM_MESSAGE_UNSUPPORTED_MODELS = {"o1-mini", "o3-mini"}
 # they accept temperature/top_p and have no reasoning effort control.
 NON_REASONING_GPT5_MODELS = {"gpt-5-chat-latest", "gpt-5.3-chat"}
 
-REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
 
 IMAGE_MODEL_CONFIGS = {
     "gpt-image-2": {
@@ -259,6 +314,7 @@ MODEL_CHOICES = [
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-6-astra",
     "o1",
     "o1-mini",
     "o1-pro",
@@ -270,7 +326,7 @@ MODEL_CHOICES = [
     "o4-mini-deep-research",
 ]
 
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_IMAGE_MODEL = "gpt-image-2"
 
 # Unknown models get a modern default rather than the old 4096, which used to
@@ -282,6 +338,22 @@ DEFAULT_OUTPUT_RESERVE_TOKENS = 8192
 MAX_OUTPUT_RESERVE_TOKENS = 32768
 
 NO_REASONING_EFFORT = "auto"
+
+# Documented exceptions to the broad family defaults below. Each model's page
+# at https://developers.openai.com/api/docs/models lists its supported efforts.
+REASONING_EFFORT_OVERRIDES = {
+    "gpt-5-pro": ("high",),
+    "gpt-5.2-pro": ("medium", "high", "xhigh"),
+    "gpt-5.4-pro": ("medium", "high", "xhigh"),
+    "gpt-5.5-pro": ("medium", "high", "xhigh"),
+    "gpt-5.2-codex": ("low", "medium", "high", "xhigh"),
+    "gpt-5.3-codex": ("low", "medium", "high", "xhigh"),
+    "gpt-5.2": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4-mini": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.4-nano": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
+}
 
 
 def get_image_model_config(image_model):
@@ -296,6 +368,10 @@ def get_max_context_tokens(model_name, web_search=False):
 
 def uses_responses_api(model_name):
     return model_name in RESPONSES_API_MODELS
+
+
+def supports_streaming(model_name):
+    return model_name not in NON_STREAMING_MODELS
 
 
 def supports_web_search(model_name):
@@ -325,6 +401,41 @@ def supports_vision(model_name):
     return model_name not in VISION_DISABLED_MODELS
 
 
+def image_token_budget(model_name, detail="auto", dimensions=None):
+    """Approximate upper-bound image tokens, without counting transport bytes."""
+    tile_costs = IMAGE_TILE_TOKEN_COSTS.get(model_name)
+    if tile_costs is not None:
+        base, per_tile = tile_costs
+        if detail == "low":
+            return base
+        tiles = 8
+        if dimensions:
+            width, height = dimensions
+            scale = min(1, 2048 / max(width, height))
+            width, height = width * scale, height * scale
+            if min(width, height) > 768:
+                scale = 768 / min(width, height)
+                width, height = floor(width * scale), floor(height * scale)
+            tiles = ceil(width / 512) * ceil(height / 512)
+        return base + tiles * per_tile
+    patch_budgets = IMAGE_PATCH_TOKEN_BUDGETS.get(model_name)
+    if patch_budgets is not None:
+        budget = patch_budgets.get(detail, patch_budgets["auto"])
+        if dimensions:
+            width, height = dimensions
+            patches = ceil(width / 32) * ceil(height / 32)
+            # Resizing only reduces dimensions. Counting the original patches,
+            # capped at the detail budget, stays conservative without reproducing
+            # the API's pixel-rounding procedure for every model family.
+            return min(budget, ceil(patches * IMAGE_PATCH_TOKEN_MULTIPLIERS[model_name]))
+        return budget
+    logger.debug(
+        "No image-sizing rule for %s; reserving an approximate %d tokens per image.",
+        model_name, DEFAULT_IMAGE_TOKEN_BUDGET,
+    )
+    return DEFAULT_IMAGE_TOKEN_BUDGET
+
+
 def max_output_tokens(model_name):
     """Documented max output tokens, or None when unknown."""
     return MODEL_MAX_OUTPUT_TOKENS.get(model_name)
@@ -334,6 +445,12 @@ def reasoning_effort_choices(model_name):
     """Effort levels this model family accepts, or [] for non-reasoning models."""
     if not is_reasoning_model(model_name):
         return []
+    if model_name in REASONING_EFFORT_OVERRIDES:
+        return [NO_REASONING_EFFORT, *REASONING_EFFORT_OVERRIDES[model_name]]
+    if model_name.startswith("gpt-6"):
+        return [NO_REASONING_EFFORT, "low", "medium", "high", "xhigh", "max"]
+    if model_name.startswith("gpt-5.6"):
+        return [NO_REASONING_EFFORT, "none", "low", "medium", "high", "xhigh", "max"]
     if model_name.startswith(("o1", "o3", "o4")):
         return [NO_REASONING_EFFORT, "low", "medium", "high"]
     if model_name == "gpt-5" or model_name.startswith("gpt-5-"):
@@ -363,16 +480,24 @@ def check_model_tables():
         "MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH": MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH,
         "MODEL_MAX_OUTPUT_TOKENS": MODEL_MAX_OUTPUT_TOKENS,
         "RESPONSES_API_MODELS": RESPONSES_API_MODELS,
+        "NON_STREAMING_MODELS": NON_STREAMING_MODELS,
         "WEB_SEARCH_MODELS": WEB_SEARCH_MODELS,
         "DEEP_RESEARCH_MODELS": DEEP_RESEARCH_MODELS,
         "VISION_DISABLED_MODELS": VISION_DISABLED_MODELS,
+        "IMAGE_TILE_TOKEN_COSTS": IMAGE_TILE_TOKEN_COSTS,
+        "IMAGE_PATCH_TOKEN_BUDGETS": IMAGE_PATCH_TOKEN_BUDGETS,
+        "IMAGE_PATCH_TOKEN_MULTIPLIERS": IMAGE_PATCH_TOKEN_MULTIPLIERS,
         "SYSTEM_MESSAGE_UNSUPPORTED_MODELS": SYSTEM_MESSAGE_UNSUPPORTED_MODELS,
         "NON_REASONING_GPT5_MODELS": NON_REASONING_GPT5_MODELS,
+        "REASONING_EFFORT_OVERRIDES": REASONING_EFFORT_OVERRIDES,
     }
     for table_name, table in auxiliary_tables.items():
         unknown = sorted(set(table) - known)
         if unknown:
             problems.append(f"unknown models in {table_name}: {unknown}")
+
+    if IMAGE_PATCH_TOKEN_BUDGETS.keys() != IMAGE_PATCH_TOKEN_MULTIPLIERS.keys():
+        problems.append("image patch budgets and multipliers cover different models")
 
     if DEFAULT_MODEL not in known:
         problems.append(f"DEFAULT_MODEL {DEFAULT_MODEL!r} is not in MODEL_CHOICES")

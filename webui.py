@@ -150,6 +150,7 @@ def on_user_input(llm_model, web_search, temperature, top_p, text, image, docume
         yield (history, replace_history_content(history)) + _keep_inputs()
         return
 
+    pending_turn_index = len(history)
     history.append(user_message)
     logger.info("User: %s", truncate(user_message["content"], 500))
 
@@ -200,12 +201,17 @@ def on_user_input(llm_model, web_search, temperature, top_p, text, image, docume
     except Exception as exc:
         logger.exception("Request to %s failed", llm_model)
         gr.Warning(_describe_failure(exc))
-        # Roll the pending turn back out so it is not silently resent next time.
-        if history and history[-1].get("role") == "assistant":
-            history.pop()
-        if history and history[-1].get("role") == "user":
-            history.pop()
-        yield (history, replace_history_content(history)) + _keep_inputs()
+        # Exclude the failed turn from future API requests, but leave its prompt
+        # visible for copying. Restoring input fields here would overwrite any
+        # new draft the user typed while the request was running.
+        history = history[:pending_turn_index]
+        display = replace_history_content(history + [user_message])
+        display.append({
+            "role": "assistant",
+            "content": f"Request failed: {_describe_failure(exc)}\n\n"
+                       "The prompt above was not added to the conversation.",
+        })
+        yield (history, display) + _keep_inputs()
 
 
 def on_new_chat_click():
@@ -237,7 +243,8 @@ def on_load_history(history_file_name):
         return history, replace_history_content(history), status
     except Exception as exc:
         logger.exception("Loading history failed")
-        return [], [], f"Error loading history: {_describe_failure(exc)}"
+        # A missing/corrupt saved file must not erase the current conversation.
+        return gr.skip(), gr.skip(), f"Error loading history: {_describe_failure(exc)}"
 
 
 def on_delete_history(history_file_name):
@@ -252,7 +259,16 @@ def on_delete_history(history_file_name):
 with gr.Blocks(title="OpenAI Chatbot") as demo:
     with gr.Row(equal_height=True):
         with gr.Column(scale=4):
-            chatbot = gr.Chatbot(buttons=["copy"], min_height=800)
+            chatbot = gr.Chatbot(
+                buttons=["copy"], min_height=800,
+                # Model replies commonly use these TeX delimiters. Gradio's
+                # default enables only $$...$$, leaving inline math unrendered.
+                latex_delimiters=[
+                    {"left": "$$", "right": "$$", "display": True},
+                    {"left": r"\[", "right": r"\]", "display": True},
+                    {"left": r"\(", "right": r"\)", "display": False},
+                ],
+            )
             state = gr.State([])
             history_column_state = gr.State(True)
             with gr.Row(equal_height=True):
@@ -341,11 +357,16 @@ with gr.Blocks(title="OpenAI Chatbot") as demo:
     ]
     user_input_outputs = [state, chatbot, text_input, image_input, document_input, url_input]
 
-    submit_event = text_input.submit(on_user_input, user_input_inputs, user_input_outputs)
-    click_event = send_button.click(on_user_input, user_input_inputs, user_input_outputs)
-    stop_button.click(None, None, None, cancels=[submit_event, click_event])
+    # Treat Enter and Send as one pending submission, preventing a second paid
+    # request when both controls are triggered before the first one finishes.
+    send_event = gr.on(
+        triggers=[text_input.submit, send_button.click],
+        fn=on_user_input, inputs=user_input_inputs, outputs=user_input_outputs,
+        trigger_mode="once", concurrency_limit=1,
+    )
+    stop_button.click(None, None, None, cancels=[send_event])
 
-    new_chat_button.click(on_new_chat_click, [], [chatbot, state])
+    new_chat_button.click(on_new_chat_click, [], [chatbot, state], cancels=[send_event])
     toggle_history_column_button.click(on_toggle_history_column, history_column_state,
                                        [history_column, history_column_state])
 
@@ -356,7 +377,8 @@ with gr.Blocks(title="OpenAI Chatbot") as demo:
                                image_output_compression)
 
     history_files_list.select(on_select_history_file, history_files_list, history_file_name)
-    load_button.click(on_load_history, history_file_name, [state, chatbot, load_status])
+    load_button.click(on_load_history, history_file_name, [state, chatbot, load_status],
+                      cancels=[send_event])
     save_button.click(on_save_history, [state, history_file_name],
                       [save_status, history_files_list])
     delete_button.click(on_delete_history, history_file_name,

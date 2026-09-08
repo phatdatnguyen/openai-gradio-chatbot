@@ -21,6 +21,9 @@ _DOCUMENT_BLOCK_PATTERN = re.compile(
     r"(?s)<<<DOCUMENT_CONTENT>>>\nFile: (.*?)\n.*?<<<END_DOCUMENT>>>"
 )
 _LINK_BLOCK_PATTERN = re.compile(r"(?s)<<<LINK_CONTENT>>>\nURL: (.*?)\n.*?<<<END_LINK>>>")
+_GENERATED_IMAGE_PATTERN = re.compile(
+    r"!\[[^\]\n]*\]\(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+\)"
+)
 
 
 def normalize_text(value):
@@ -48,11 +51,25 @@ def image_file_to_data_url(image_path):
     from PIL import Image  # local import keeps module import cost down
 
     with Image.open(image_path) as image:
+        if image.mode not in ("1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"):
+            image = image.convert("RGB")
         return f"{IMAGE_DATA_URL_PREFIX}{encode_image(image)}"
 
 
 def is_data_url(value):
-    return bool(value) and bool(DATA_URL_PATTERN.match(value))
+    return isinstance(value, str) and bool(DATA_URL_PATTERN.match(value))
+
+
+def _api_content(message):
+    """Keep generated image bytes out of the model's plain-text conversation.
+
+    The full image remains in history for display and saving. Sending its base64
+    markdown as text can exhaust the context budget on the next user turn.
+    """
+    content = message.get("content", "")
+    if message.get("role") == "assistant" and isinstance(content, str):
+        content = _GENERATED_IMAGE_PATTERN.sub("[Generated image]", content)
+    return content
 
 
 def build_document_block(file_name, document_text):
@@ -71,7 +88,7 @@ def prepare_chat_messages(history):
     """Convert history to a Chat Completions ``messages`` list."""
     messages = []
     for message in history or []:
-        content = message.get("content", "")
+        content = _api_content(message)
         image_url = message.get("image_url")
         if message.get("role") == "user" and image_url:
             user_content = []
@@ -88,7 +105,7 @@ def prepare_responses_input(history):
     """Convert history to a Responses API ``input`` list."""
     messages = []
     for message in history or []:
-        content = message.get("content", "")
+        content = _api_content(message)
         image_url = message.get("image_url")
         role = message.get("role", "user")
         if role == "user" and image_url:

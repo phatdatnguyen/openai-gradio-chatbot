@@ -7,7 +7,8 @@ tiktoken
 urllib3
 html2text
 pypdf
-python-docx
+python-docx>=1.2.0
 python-pptx
 openpyxl
+xlrd
 Pillow
