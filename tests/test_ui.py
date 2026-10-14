@@ -3,13 +3,14 @@
 import importlib
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import api
-import history_store
+from chatbot import api
+from chatbot import history_store
 
 
 @pytest.fixture
@@ -18,7 +19,10 @@ def ui(monkeypatch):
     # Gradio analytics. OpenAI calls are stubbed individually below.
     monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "False")
     monkeypatch.setattr(history_store, "get_history_file_list", lambda: [])
-    return importlib.import_module("webui")
+    module = importlib.import_module("chatbot.chatbot")
+    with module.gr.Blocks() as demo:
+        components = module.build_tab()
+    return SimpleNamespace(**vars(module), **vars(components), demo=demo)
 
 
 def _send(ui, history, **overrides):

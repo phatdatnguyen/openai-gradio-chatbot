@@ -1,12 +1,25 @@
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .vs/
 .gradio/
-.vs/
 chatbot-env/
+.venv/
+venv/
 history/
+.cache/
+rag_chatbot/data/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+!.env.example
 
 api_key.py
 CLAUDE.md
-*.txt
-!requirements.txt
-!requirements-dev.txt
+# Local dated chat exports; source fixtures and license files remain trackable.
+/20??-??-??-*.txt

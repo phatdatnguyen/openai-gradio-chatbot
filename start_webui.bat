@@ -8,4 +8,6 @@ if not exist "chatbot-env\Scripts\python.exe" (
     exit /b 1
 )
 "chatbot-env\Scripts\python.exe" webui.py
+set "WEBUI_EXIT_CODE=%ERRORLEVEL%"
 pause
+exit /b %WEBUI_EXIT_CODE%

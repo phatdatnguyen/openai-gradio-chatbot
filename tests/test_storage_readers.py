@@ -15,9 +15,9 @@ from pptx.util import Inches
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import history_store
-import messages
-import readers
+from chatbot import history_store
+from chatbot import messages
+from chatbot import readers
 
 
 @pytest.fixture
@@ -126,6 +126,23 @@ def test_invalid_history_messages_fail_before_loading(history_dir, entry):
 @pytest.mark.parametrize("name, expected", [("CON", "_CON"), ("nul.txt", "_nul.txt"), ("LPT1", "_LPT1"), ("name. ", "name"), (" .. ", "Chat history")])
 def test_history_names_are_valid_on_windows(name, expected):
     assert history_store.sanitize_history_file_name(name) == expected
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("x" * 101, "x" * 100),
+    ("\U0001f600" * 100, "\U0001f600" * 62),
+    ("\U0001f600" * 62 + "\u00e9", "\U0001f600" * 62 + "\u00e9"),
+    ("\U0001f600" * 62 + "\u754c", "\U0001f600" * 62),
+])
+def test_unicode_history_names_save_and_load_with_portable_byte_limits(history_dir, name, expected):
+    safe = history_store.sanitize_history_file_name(name)
+    assert safe == expected
+    assert len(safe) <= 100
+    assert len((safe + ".json").encode("utf-8")) <= 255
+    original = [{"role": "user", "content": "Saved across operating systems"}]
+    history_store.save_history(original, name)
+    assert (history_dir / f"{safe}.json").is_file()
+    assert history_store.load_history(name)[0] == original
 
 
 def test_cmyk_jpeg_upload_is_converted_to_rgb_png(tmp_path):

@@ -11,17 +11,21 @@ from math import ceil, floor
 
 from openai import OpenAI
 
-from log import logger
+from .log import logger
 
 try:
-    from api_key import API_KEY as FILE_API_KEY
+    from .api_key import API_KEY as FILE_API_KEY
 except ImportError:
-    FILE_API_KEY = None
+    try:
+        from api_key import API_KEY as FILE_API_KEY
+    except ImportError:
+        FILE_API_KEY = None
 
 
 MISSING_KEY_MESSAGE = (
     "No OpenAI API key found. Either set the OPENAI_API_KEY environment variable, "
-    "or create api_key.py next to webui.py containing:  API_KEY = \"sk-...\""
+    "or create chatbot/api_key.py containing:  API_KEY = \"sk-...\" "
+    "(api_key.py next to webui.py is also supported)."
 )
 
 
@@ -75,6 +79,9 @@ MODEL_TOKEN_LIMITS = {
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
     "gpt-5.6-sol": 1050000,
+    "gpt-6-luna": 1050000,
+    "gpt-6-sol": 1050000,
+    "gpt-6.1-sol": 1050000,
     "gpt-6-astra": 1050000,
     "o1": 128000,
     "o1-mini": 128000,
@@ -108,6 +115,9 @@ MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH = {
     "gpt-5.6-luna": 128000,
     "gpt-5.6-terra": 128000,
     "gpt-5.6-sol": 128000,
+    "gpt-6-luna": 128000,
+    "gpt-6-sol": 128000,
+    "gpt-6.1-sol": 128000,
     "gpt-6-astra": 128000,
     "o1": 128000,
     "o3": 128000,
@@ -131,12 +141,16 @@ MODEL_MAX_OUTPUT_TOKENS = {
     "gpt-5.6-luna": 128000,
     "gpt-5.6-terra": 128000,
     "gpt-5.6-sol": 128000,
+    "gpt-6-luna": 128000,
+    "gpt-6-sol": 128000,
+    "gpt-6.1-sol": 128000,
     "gpt-6-astra": 128000,
 }
 
-# Models only reachable through client.responses.*, never chat.completions.
+# Models routed through client.responses.*, including those that require it.
 # The "-pro" family is Responses-only across the board; gpt-5-pro / gpt-5.2-pro /
 # gpt-5.4-pro used to be missing here, which silently routed them to the wrong API.
+# GPT-6 Luna/Sol/6.1 Sol use Responses to support tools at every reasoning effort.
 RESPONSES_API_MODELS = {
     "o1-pro",
     "o3-pro",
@@ -151,6 +165,9 @@ RESPONSES_API_MODELS = {
     "gpt-5.3-codex",
     "gpt-5.4-pro",
     "gpt-5.5-pro",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
 }
 
 # These models need a blocking response even when the UI requests streaming.
@@ -178,6 +195,9 @@ WEB_SEARCH_MODELS = {
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "o3",
     "o3-pro",
@@ -252,6 +272,10 @@ NON_REASONING_GPT5_MODELS = {"gpt-5-chat-latest", "gpt-5.3-chat"}
 
 REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
 
+# The GPT-6 guide permits sampling parameters only when reasoning is disabled.
+# Keep other reasoning models' existing conservative omission behavior.
+SAMPLING_WITHOUT_REASONING_MODELS = {"gpt-6-luna", "gpt-6-sol"}
+
 IMAGE_MODEL_CONFIGS = {
     "gpt-image-2": {
         "size_choices": ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "3840x2160", "2160x3840"],
@@ -314,6 +338,9 @@ MODEL_CHOICES = [
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "o1",
     "o1-mini",
@@ -326,7 +353,7 @@ MODEL_CHOICES = [
     "o4-mini-deep-research",
 ]
 
-DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_IMAGE_MODEL = "gpt-image-2"
 
 # Unknown models get a modern default rather than the old 4096, which used to
@@ -353,6 +380,9 @@ REASONING_EFFORT_OVERRIDES = {
     "gpt-5.4-mini": ("none", "low", "medium", "high", "xhigh"),
     "gpt-5.4-nano": ("none", "low", "medium", "high", "xhigh"),
     "gpt-5.5": ("none", "low", "medium", "high", "xhigh"),
+    "gpt-6-luna": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
+    "gpt-6.1-sol": ("low", "medium", "high", "xhigh", "max"),
 }
 
 
@@ -388,9 +418,11 @@ def is_reasoning_model(model_name):
     return model_name.startswith(REASONING_MODEL_PREFIXES)
 
 
-def supports_temperature(model_name):
-    """Reasoning models reject temperature/top_p, so we omit them entirely."""
-    return not is_reasoning_model(model_name)
+def supports_temperature(model_name, reasoning_effort=None):
+    """Allow sampling only for conventional models or a documented effort-none mode."""
+    return not is_reasoning_model(model_name) or (
+        model_name in SAMPLING_WITHOUT_REASONING_MODELS and reasoning_effort == "none"
+    )
 
 
 def supports_system_message(model_name):
@@ -489,6 +521,7 @@ def check_model_tables():
         "IMAGE_PATCH_TOKEN_MULTIPLIERS": IMAGE_PATCH_TOKEN_MULTIPLIERS,
         "SYSTEM_MESSAGE_UNSUPPORTED_MODELS": SYSTEM_MESSAGE_UNSUPPORTED_MODELS,
         "NON_REASONING_GPT5_MODELS": NON_REASONING_GPT5_MODELS,
+        "SAMPLING_WITHOUT_REASONING_MODELS": SAMPLING_WITHOUT_REASONING_MODELS,
         "REASONING_EFFORT_OVERRIDES": REASONING_EFFORT_OVERRIDES,
     }
     for table_name, table in auxiliary_tables.items():

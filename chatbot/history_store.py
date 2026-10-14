@@ -15,13 +15,25 @@ import re
 import shutil
 import tempfile
 
-from log import logger
-from messages import is_data_url, normalize_text
+from .log import logger
+from .messages import is_data_url, normalize_text
 
-HISTORY_DIR = "history"
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_HISTORY_DIR = os.path.join(PACKAGE_DIR, "history")
+LEGACY_HISTORY_DIR = os.path.join(os.path.dirname(PACKAGE_DIR), "history")
+# Keep existing chats visible until the legacy directory has been migrated.
+# Both paths are anchored to the project, independent of the launch directory.
+HISTORY_DIR = (
+    LEGACY_HISTORY_DIR
+    if not os.path.isdir(DEFAULT_HISTORY_DIR) and os.path.isdir(LEGACY_HISTORY_DIR)
+    else DEFAULT_HISTORY_DIR
+)
 ASSETS_DIR_NAME = "assets"
 DEFAULT_HISTORY_NAME = "Chat history"
 MAX_HISTORY_NAME_LENGTH = 100
+# Reserve the .json suffix within the 255-byte filename limit on common Unix
+# filesystems. The character cap also stays within Windows' UTF-16 limit.
+MAX_HISTORY_NAME_BYTES = 250
 
 _UNSAFE_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_DEVICE_NAME = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", re.IGNORECASE)
@@ -48,7 +60,9 @@ def sanitize_history_file_name(history_file_name):
     sanitized = sanitized.strip().lstrip(".").rstrip(". ")
     if _WINDOWS_DEVICE_NAME.match(sanitized):
         sanitized = "_" + sanitized
-    return sanitized[:MAX_HISTORY_NAME_LENGTH].rstrip(". ") or DEFAULT_HISTORY_NAME
+    sanitized = sanitized[:MAX_HISTORY_NAME_LENGTH]
+    sanitized = sanitized.encode("utf-8")[:MAX_HISTORY_NAME_BYTES].decode("utf-8", errors="ignore")
+    return sanitized.rstrip(". ") or DEFAULT_HISTORY_NAME
 
 
 def history_file_path(safe_name):

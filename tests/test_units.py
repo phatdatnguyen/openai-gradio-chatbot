@@ -12,12 +12,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import api
-import config
-import history_store
-import messages
-import readers
-import tokens
+from chatbot import api
+from chatbot import config
+from chatbot import history_store
+from chatbot import messages
+from chatbot import readers
+from chatbot import tokens
 
 PNG_1PX = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AARAAA//8DAgH/"
@@ -290,9 +290,10 @@ def test_html_is_converted_to_text(tmp_path):
 
 @pytest.fixture
 def history_dir(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "history").mkdir()
-    return tmp_path / "history"
+    directory = tmp_path / "history"
+    directory.mkdir()
+    monkeypatch.setattr(history_store, "HISTORY_DIR", str(directory))
+    return directory
 
 
 def test_sanitize_history_file_name():

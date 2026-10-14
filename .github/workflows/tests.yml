@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.10', '3.13']
+    env:
+      OPENAI_API_KEY: offline-test-placeholder
+      GRADIO_ANALYTICS_ENABLED: 'False'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Run offline tests
+        run: python -m pytest -q
+      - name: Exercise both tabs over localhost
+        run: python tests/manual_rag_smoke.py
+      - name: Install optional LibreOffice converter
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-writer libreoffice-impress fonts-dejavu-core
+      - name: Check real LibreOffice previews
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        env:
+          RUN_LIBREOFFICE_SMOKE: '1'
+        run: python -m pytest -q tests/test_libreoffice_integration.py

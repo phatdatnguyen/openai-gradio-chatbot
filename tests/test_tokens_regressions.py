@@ -10,8 +10,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tokens
-import messages
+from chatbot import tokens
+from chatbot import messages
 
 
 @pytest.mark.parametrize("model", ["gpt-4", "gpt-4o", "gpt-5.5"])

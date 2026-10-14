@@ -10,13 +10,18 @@ so history was being trimmed far more aggressively than necessary.
 import base64
 import binascii
 import io
+import os
 from functools import lru_cache
+from pathlib import Path
 
 import tiktoken
 
-import config
-from log import logger
-from messages import is_data_url, serialize_message_value
+# Keep downloaded public tokenizer assets alongside this local application.
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(Path(__file__).resolve().parents[1] / ".cache" / "tiktoken"))
+
+from . import config
+from .log import logger
+from .messages import is_data_url, serialize_message_value
 
 # gpt-4o and everything after it uses o200k_base; cl100k_base is only correct for
 # the gpt-4 / gpt-3.5 generation, which tiktoken already knows about by name.

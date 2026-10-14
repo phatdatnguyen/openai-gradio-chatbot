@@ -10,7 +10,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pypdf import PdfReader
 
-from log import logger
+from .log import logger
 
 # Sparse extracted text can indicate scanned pages, but legitimate short PDFs
 # also fall below this threshold and must keep their available text.
