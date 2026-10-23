@@ -7,9 +7,11 @@ uploads, interrupted retries and failed vector cleanup cannot expose stale data.
 
 import hashlib
 import math
+import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import unicodedata
 import uuid
@@ -88,7 +90,7 @@ class LibraryStore:
             CREATE TABLE IF NOT EXISTS chunks (
                 id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id),
                 text TEXT NOT NULL, locator TEXT NOT NULL, kind TEXT NOT NULL,
-                image_path TEXT
+                image_path TEXT, ordinal INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS chunks_document ON chunks(document_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -109,6 +111,20 @@ class LibraryStore:
             END;
             CREATE TEMP TABLE scoped_documents (id TEXT PRIMARY KEY);
         """)
+        # Preserve extraction order for whole-document tools. Older libraries
+        # inserted chunks in order, so rowid provides the migration ordering.
+        with self._db:
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(chunks)")}
+            if "ordinal" not in columns:
+                self._db.execute("ALTER TABLE chunks ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0")
+                self._db.execute("""
+                    WITH ordered AS (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY document_id ORDER BY rowid) - 1 AS position FROM chunks
+                    )
+                    UPDATE chunks SET ordinal=(SELECT position FROM ordered WHERE ordered.id=chunks.id)
+                """)
+            self._db.execute("CREATE INDEX IF NOT EXISTS chunks_order ON chunks(document_id,ordinal)")
 
     def _managed_path(self, value):
         path = Path(value)
@@ -222,10 +238,26 @@ class LibraryStore:
                 "AND fingerprint=? AND status != 'deleted'", (digest, collection, fingerprint)
             ).fetchone()
             if existing is not None:
+                destination = self._managed_path(existing["path"])
+                # A catalog match does not guarantee that the managed original
+                # survived a restore, interrupted copy, or manual file change.
+                # Repair it from this verified upload without redoing paid work.
+                if (not destination.is_file() or self._hash_file(destination) != digest):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    descriptor, temporary_name = tempfile.mkstemp(prefix=".restore-", dir=destination.parent)
+                    os.close(descriptor)
+                    temporary = Path(temporary_name)
+                    try:
+                        shutil.copyfile(source, temporary)
+                        if self._hash_file(temporary) != digest:
+                            raise ValueError("The document changed during import. Please try again.")
+                        os.replace(temporary, destination)
+                    finally:
+                        temporary.unlink(missing_ok=True)
                 if display_name is not None and display_name != existing["name"]:
                     self._db.execute("UPDATE documents SET name=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                                      (display_name, existing["id"]))
-                if existing["status"] == "ready" and not force:
+                if existing["status"] == "ready" and existing["generation"] and not force:
                     return dict(self.get_document(existing["id"]), unchanged=True)
                 # A staging row can also be retried after a process interruption.
                 # Publication later checks its status again before making it ready.
@@ -298,10 +330,10 @@ class LibraryStore:
                         raise ValueError("The document was deleted or published during indexing.")
                     self._db.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
                     self._db.executemany(
-                        "INSERT INTO chunks(id,document_id,text,locator,kind,image_path) VALUES (?,?,?,?,?,?)",
+                        "INSERT INTO chunks(id,document_id,text,locator,kind,image_path,ordinal) VALUES (?,?,?,?,?,?,?)",
                         [(chunk.id, document_id, chunk.text, chunk.locator, chunk.kind,
-                          str(self._managed_path(chunk.image_path)) if chunk.image_path else None)
-                         for chunk in chunks],
+                          str(self._managed_path(chunk.image_path)) if chunk.image_path else None, ordinal)
+                         for ordinal, chunk in enumerate(chunks)],
                     )
                     self._db.execute(
                         "UPDATE documents SET status='ready',error='',chunk_count=?,generation=?,"
@@ -344,10 +376,81 @@ class LibraryStore:
         with self._lock:
             row = self._db.execute(
                 "SELECT c.* FROM chunks c JOIN documents d ON d.id=c.document_id "
-                "WHERE c.id=? AND d.status='ready' AND d.fingerprint=?",
+                "WHERE c.id=? AND d.status='ready' AND d.fingerprint=? AND d.generation!=''",
                 (chunk_id, self.settings.fingerprint()),
             ).fetchone()
-            return Chunk(**dict(row)) if row else None
+            return Chunk(**{key: row[key] for key in Chunk.__dataclass_fields__}) if row else None
+
+    def snapshot_sources(self, document_ids, collection=None, *, max_documents=40,
+                         max_chunks=512, max_characters=500_000):
+        """Snapshot a complete, bounded selection without querying Qdrant.
+
+        A single SQLite statement sees one published catalog generation. Reject
+        stale selections rather than quietly generating an incomplete artifact.
+        The caller owns the returned copies and must validate them before use.
+        """
+        if (not isinstance(document_ids, (list, tuple))
+                or any(not isinstance(value, str) or not value for value in document_ids)):
+            raise ValueError("Select source document identifiers as a list.")
+        selected = list(dict.fromkeys(document_ids))
+        if not selected:
+            raise ValueError("Select at least one indexed source for this tool.")
+        if len(selected) > max_documents:
+            raise ValueError(f"Select at most {max_documents} documents per tool run.")
+        if collection is not None:
+            collection = self._label(collection, "Collection")
+        placeholders = ",".join("?" for _ in selected)
+        query = (
+            "SELECT d.*,c.id AS chunk_id,c.text AS chunk_text,c.locator AS chunk_locator,"
+            "c.image_path AS chunk_image_path,c.ordinal AS chunk_ordinal "
+            "FROM documents d JOIN chunks c ON c.document_id=d.id "
+            f"WHERE d.id IN ({placeholders}) AND d.status='ready' AND d.fingerprint=? "
+            "AND d.generation!=''"
+        )
+        values = [*selected, self.settings.fingerprint()]
+        if collection is not None:
+            query += " AND d.collection=?"
+            values.append(collection)
+        query += " ORDER BY d.id,c.ordinal,c.rowid LIMIT ?"
+        values.append(max_chunks + 1)
+        with self._lock:
+            rows = self._db.execute(query, values).fetchall()
+            if len(rows) > max_chunks:
+                raise ValueError(f"This selection exceeds {max_chunks} chunks. Select fewer sources.")
+            if sum(len(row["chunk_text"]) for row in rows) > max_characters:
+                raise ValueError("This selection is too large for one tool run. Select fewer sources.")
+            documents, sources = {}, {identifier: [] for identifier in selected}
+            document_keys = ("id", "name", "collection", "content_hash", "fingerprint",
+                             "generation", "chunk_count")
+            for row in rows:
+                documents[row["id"]] = {key: row[key] for key in document_keys}
+                source = {"id": row["chunk_id"], "document_id": row["id"],
+                          "filename": row["name"], "locator": row["chunk_locator"],
+                          "text": row["chunk_text"],
+                          "source_path": str(self._managed_path(row["path"]))}
+                if row["chunk_image_path"]:
+                    source["image_path"] = str(self._managed_path(row["chunk_image_path"]))
+                sources[row["id"]].append(source)
+            if set(documents) != set(selected):
+                raise ValueError("A selected source is unavailable, not indexed, or outside the active collection. "
+                                 "Refresh the source list before generating.")
+            if any(len(sources[identifier]) != documents[identifier]["chunk_count"]
+                   for identifier in selected):
+                raise ValueError("A source has an incomplete index. Reindex it before generating.")
+            return {"documents": [documents[identifier] for identifier in selected],
+                    "sources": [source for identifier in selected for source in sources[identifier]]}
+
+    def validate_source_snapshot(self, documents):
+        """Reject a changed/deleted source generation, including during a run."""
+        with self._lock:
+            for expected in documents:
+                current = self._db.execute("SELECT * FROM documents WHERE id=?",
+                                           (expected["id"],)).fetchone()
+                if (current is None or current["status"] != "ready"
+                        or current["fingerprint"] != self.settings.fingerprint()
+                        or any(current[key] != expected[key] for key in
+                               ("content_hash", "fingerprint", "generation", "collection", "chunk_count"))):
+                    raise ValueError("A selected source changed during generation. Refresh sources and try again.")
 
     @staticmethod
     def _fts_query(query):
@@ -370,7 +473,7 @@ class LibraryStore:
         selected = None if document_ids is None else set(document_ids)
         with self._lock:
             active = self._db.execute(
-                "SELECT * FROM documents WHERE status='ready' AND collection=? AND fingerprint=?",
+                "SELECT * FROM documents WHERE status='ready' AND collection=? AND fingerprint=? AND generation!=''",
                 (collection, self.settings.fingerprint()),
             ).fetchall()
             active = [row for row in active if selected is None or row["id"] in selected]
@@ -410,7 +513,7 @@ class LibraryStore:
                 row = self._db.execute(
                     "SELECT c.*,d.name,d.path FROM chunks c JOIN documents d ON d.id=c.document_id "
                     "JOIN scoped_documents scope ON scope.id=d.id WHERE c.id=? AND d.status='ready' "
-                    "AND d.fingerprint=?", (chunk_id, self.settings.fingerprint()),
+                    "AND d.fingerprint=? AND d.generation!=''", (chunk_id, self.settings.fingerprint()),
                 ).fetchone()
                 if row:
                     chunk = Chunk(**{key: row[key] for key in Chunk.__dataclass_fields__})

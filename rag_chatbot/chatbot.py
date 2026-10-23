@@ -84,6 +84,12 @@ def _library_updates(workspace, collection=None, selected_ids=None, operation_st
             selected |= ready - set(operation_state.get("known_ready_ids", ready))
     selected = [value for _, value in choices if value in selected and value in allowed]
     if operation_state is not None:
+        if ("selected_ids" in operation_state
+                and set(operation_state["selected_ids"]) != set(selected)):
+            # Refresh/indexing can change checkbox values programmatically;
+            # those updates do not emit the user-input cancellation callback.
+            from .tools.ui import cancel_tool_job
+            cancel_tool_job(operation_state)
         operation_state["selected_ids"] = selected
         operation_state["known_ready_ids"] = list(ready)
     return (frame, gr.update(choices=collection_choices, value=current),
@@ -95,6 +101,8 @@ def on_source_selection(selected_ids, operation_state, history=None, pending=Non
         return (gr.skip(),) * 11
     operation_state["selected_ids"] = list(dict.fromkeys(selected_ids or []))
     operation_state["answer_revision"] = operation_state.get("answer_revision", 0) + 1
+    from .tools.ui import cancel_tool_job
+    cancel_tool_job(operation_state)
     return on_stop_chat(history, pending) if pending else (gr.skip(),) * 11
 
 
@@ -135,6 +143,12 @@ def on_upload_change(paths, filename, selected, editor_path, upload_names):
                       value=selected, visible=len(paths) > 1), selected or "")
 
 
+def on_upload_files_change(paths, filename, editor_path, upload_names):
+    # File events can outlive a workspace reset. Read the current selection
+    # from session state, not a dropdown whose choices have already changed.
+    return on_upload_change(paths, filename, upload_names.get("selected"), editor_path, upload_names)
+
+
 def on_upload_name(filename, editor_path, upload_names):
     _save_upload_edit(filename, editor_path, upload_names.get("names", {}), dirty=True)
     return upload_names
@@ -142,6 +156,8 @@ def on_upload_name(filename, editor_path, upload_names):
 
 def on_upload_selection(selected, filename, editor_path, upload_names):
     names = upload_names.get("names", {})
+    if not isinstance(selected, str) or selected not in names:
+        return (gr.skip(),) * 3
     _save_upload_edit(filename, editor_path, names)
     upload_names["selected"] = selected if selected in names else None
     return upload_names, names[selected]["name"] if selected in names else "", selected if selected in names else ""
@@ -170,6 +186,8 @@ def _empty_viewer(status=""):
 def _reset_viewer(operation_state=None, status=""):
     if operation_state is not None:
         operation_state["viewer_revision"] = operation_state.get("viewer_revision", 0) + 1
+        operation_state["viewer_sheets"] = []
+        operation_state.pop("review_loaded", None)
     return _empty_viewer(status)
 
 
@@ -182,6 +200,7 @@ def _review_updates(workspace, document_id=None, operation_state=None, *, reset=
     selected = document_id if document_id in {value for _, value in choices} else None
     if operation_state is not None:
         operation_state["review_document_id"] = selected
+        operation_state["review_document_ids"] = [value for _, value in choices]
     viewer = (gr.skip(),) * VIEWER_OUTPUT_COUNT if selected else _reset_viewer(operation_state)
     return (gr.update(choices=choices, value=selected), *viewer)
 
@@ -215,51 +234,114 @@ def on_prepare_workspace_switch(workspace, operation_state):
     # generator still inside a blocking request before changing visible state.
     operation_state["revision"] += 1
     operation_state["switching"] = True
+    operation_state["workspace_open_pending"] = True
+    from .tools.ui import cancel_tool_job
+    cancel_tool_job(operation_state)
     if workspace:
         try:
             get_service(workspace).cancel_ingestion()
         except Exception:
             logger.exception("Canceling indexing before a workspace switch failed")
-    return operation_state, "Opening workspace...", gr.update(interactive=False)
+    return operation_state, "Opening workspace...", gr.update(interactive=False), gr.update(interactive=False)
 
 
 def on_finish_workspace_switch(operation_state):
     # This runs only after Gradio has applied the open callback's workspace,
     # conversation and reference outputs, so new jobs cannot capture old state.
+    if operation_state.get("workspace_open_pending", False):
+        return operation_state, gr.update(interactive=False), gr.update(interactive=False)
     operation_state["revision"] += 1
     operation_state["switching"] = False
-    return operation_state, gr.update(interactive=True)
+    return operation_state, gr.update(interactive=True), gr.update(interactive=True)
 
 
 def on_open_workspace(name, current_workspace, current_history=None, pending=None, operation_state=None):
+    revision = operation_state.get("revision", 0) if operation_state is not None else None
+
+    def current():
+        return operation_state is None or operation_state.get("revision", 0) == revision
+
     try:
         canonical = _workspaces().workspace_path(name, create=True).name
         service = get_service(canonical)
-        selection = {}
+        selection = {"viewer_revision": operation_state.get("viewer_revision", 0)} if operation_state is not None else {}
         library = _library_updates(canonical, operation_state=selection, reset=True)
         saved = _history_store().list_chats(data_dir=service.settings.data_dir)
+        review = _review_updates(canonical, operation_state=selection, reset=True)
+        choices = _workspaces().list_workspaces()
+        if not current():
+            return (gr.skip(),) * (24 + REVIEW_OUTPUT_COUNT + UPLOAD_OUTPUT_COUNT)
         if operation_state is not None:
             operation_state.update(selection)
-        return (canonical, gr.update(choices=_workspaces().list_workspaces(), value=canonical),
+        return (canonical, gr.update(choices=choices, value=canonical),
                 f"Workspace: {canonical}", *library, "Library refreshed.",
                 gr.update(choices=saved, value=None), None, DEFAULT_COLLECTION, "", "RAG chat", "",
                 *_answer_update([], [], question=""),
-                *_review_updates(canonical, operation_state=operation_state, reset=True),
+                *review,
                 {}, gr.update(value="", interactive=False), gr.update(choices=[], value=None, visible=False), "")
     except Exception as exc:
         logger.exception("Opening a RAG workspace failed")
+        if not current():
+            return (gr.skip(),) * (24 + REVIEW_OUTPUT_COUNT + UPLOAD_OUTPUT_COUNT)
         stopped = on_stop_chat(current_history, pending) if pending is not None else None
         return _workspace_error(f"Could not open workspace: {exc}", stopped)
     finally:
-        if operation_state is not None:
+        if operation_state is not None and current():
             # Also invalidate work submitted between the switch request and
             # this serialized commit; it must never render into the new chat.
             operation_state["revision"] += 1
+            if "workspace_open_pending" in operation_state:
+                operation_state["workspace_open_pending"] = False
 
 
 def _current_operation(operation_state, revision):
     return (operation_state["revision"] == revision
             and not operation_state.get("switching", False))
+
+
+def on_workspace_selection(name, current_workspace, current_history, pending, operation_state):
+    """Open a changed selection, ignoring Dropdown's unchanged blur events.
+
+    The selection handler is serialized with storage operations. Its cooperative
+    revision guards stop old answers/previews without canceling work on mere blur.
+    Keep opening and tool restoration in this job so duplicate input events see
+    the newly committed workspace before deciding whether to switch again.
+    """
+    from .tools.ui import TOTAL_OUTPUT_COUNT, on_workspace_reset
+
+    workspace_count = 24 + REVIEW_OUTPUT_COUNT + UPLOAD_OUTPUT_COUNT
+    output_count = workspace_count + TOTAL_OUTPUT_COUNT + 2
+    if not name or name.strip().casefold() == (current_workspace or "").strip().casefold():
+        yield (gr.skip(),) * output_count
+        return
+    prepared = on_prepare_workspace_switch(current_workspace, operation_state)
+    revision = operation_state["revision"]
+    preparing = [gr.skip()] * output_count
+    preparing[1] = prepared[3]
+    preparing[2] = prepared[1]
+    preparing[-2:] = [prepared[0], prepared[2]]
+    yield tuple(preparing)
+    if operation_state["revision"] != revision:
+        return
+    opened = list(on_open_workspace(name, current_workspace, current_history, pending, operation_state))
+    committed_revision = revision + 1
+    if operation_state["revision"] != committed_revision or operation_state.get("workspace_open_pending"):
+        return
+    tool_outputs = (on_workspace_reset(opened[0], operation_state) if isinstance(opened[0], str)
+                    else (gr.skip(),) * TOTAL_OUTPUT_COUNT)
+    if operation_state["revision"] != committed_revision:
+        return
+    # Commit the new active State before allowing new answer/tool requests.
+    # Gradio applies each yield before requesting the generator's next item.
+    opened[1] = {**opened[1], "interactive": False}
+    yield (*opened, *tool_outputs, operation_state, gr.update(interactive=False))
+    if operation_state["revision"] != committed_revision:
+        return
+    finished, button, dropdown = on_finish_workspace_switch(operation_state)
+    ready = [gr.skip()] * output_count
+    ready[1] = dropdown
+    ready[-2:] = [finished, button]
+    yield tuple(ready)
 
 
 def on_index(paths, collection, use_vision, workspace, operation_state, review_id=None,
@@ -299,6 +381,13 @@ def on_index(paths, collection, use_vision, workspace, operation_state, review_i
             yield f"Indexing failed: {exc}", *updates[:3], *updates[4:]
 
 
+def on_index_uploads(paths, collection, use_vision, workspace, operation_state,
+                     filename, upload_names, editor_path):
+    yield from on_index(paths, collection, use_vision, workspace, operation_state,
+                        operation_state.get("review_document_id"), filename, upload_names,
+                        upload_names.get("selected"), editor_path)
+
+
 def on_stop_index(workspace):
     try:
         get_service(workspace).cancel_ingestion()
@@ -313,6 +402,10 @@ def on_delete_documents(selected_ids, collection, workspace, review_id=None, ope
         return (gr.skip(), gr.skip(), gr.skip(), "Select documents before removing them.",
                 *((gr.skip(),) * REVIEW_OUTPUT_COUNT))
     try:
+        if operation_state is not None:
+            from .tools.ui import cancel_tool_job
+            cancel_tool_job(operation_state)
+            operation_state["answer_revision"] = operation_state.get("answer_revision", 0) + 1
         service = get_service(workspace)
         available = {item["id"] for item in service.store.list_documents(collection)}
         if any(item not in available for item in selected_ids):
@@ -335,13 +428,28 @@ def on_model_change(model):
                      interactive=bool(choices))
 
 
+def on_generation_options_change(model, reasoning_effort):
+    sampling = model_config.supports_temperature(model, reasoning_effort)
+    streaming = model_config.supports_streaming(model)
+    return (gr.update(interactive=sampling), gr.update(interactive=sampling),
+            gr.update(interactive=streaming, **({"value": False} if not streaming else {})))
+
+
+def on_web_search_model_change(model):
+    required = model_config.requires_web_search(model)
+    return gr.update(value="medium" if required else model_config.WEB_SEARCH_OFF,
+                     choices=["low", "medium", "high"] if required else model_config.WEB_SEARCH_CONTEXT_CHOICES,
+                     interactive=model_config.supports_web_search(model))
+
+
 def _answer_update(history, sources, question=None, status="", display=None, pending=None):
     table, selector = _source_updates(sources)
     return (history, _display(history) if display is None else display, sources, table, selector,
             gr.skip() if question is None else question, status, None, None, "", pending)
 
 
-def on_answer(question, history, collection, selected_ids, model, reasoning_effort, workspace, operation_state):
+def on_answer(question, history, collection, selected_ids, model, reasoning_effort, workspace, operation_state,
+              web_search=model_config.WEB_SEARCH_OFF, stream_output=True, temperature=1.0, top_p=1.0):
     revision = operation_state["revision"]
     answer_revision = operation_state.get("answer_revision", 0)
 
@@ -357,12 +465,14 @@ def on_answer(question, history, collection, selected_ids, model, reasoning_effo
     if not question:
         yield (gr.skip(),) * 6 + ("Enter a question about your documents.",) + (gr.skip(),) * 4
         return
-    if not selected_ids:
+    use_search = bool(web_search) and web_search != model_config.WEB_SEARCH_OFF
+    if not selected_ids and not use_search:
         yield (gr.skip(),) * 6 + ("No sources selected. Check at least one ready source before sending a question.",) + (gr.skip(),) * 4
         return
     pending_turn = {"history": previous, "question": question, "workspace": workspace}
     pending = _display(previous) + [{"role": "user", "content": question}]
-    yield _answer_update(previous, [], question="", status="Searching your documents…", display=pending,
+    yield _answer_update(previous, [], question="", status=("Searching documents and the web…" if use_search
+                         else "Searching your documents…"), display=pending,
                          pending=pending_turn)
     try:
         if not still_current():
@@ -370,8 +480,9 @@ def on_answer(question, history, collection, selected_ids, model, reasoning_effo
         latest = None
         service = get_service(workspace)
         with closing(service.answer(
-            question, previous, collection, document_ids=list(selected_ids),
+            question, previous, collection, document_ids=list(selected_ids or []),
             model=model, reasoning_effort=reasoning_effort,
+            web_search=web_search, stream_output=stream_output, temperature=temperature, top_p=top_p,
         )) as replies:
             for updated, sources in replies:
                 if not still_current():
@@ -409,9 +520,10 @@ def _safe_source_path(value, workspace):
     if not value:
         return None
     root = Path(get_service(workspace).settings.data_dir).resolve()
+    source_root = root / "sources"
     path = Path(value)
     path = (root / path).resolve() if not path.is_absolute() else path.resolve()
-    if not path.is_relative_to(root):
+    if source_root.resolve() != source_root or not path.is_relative_to(source_root):
         raise ValueError("The source is outside the document library.")
     return str(path) if path.is_file() else None
 
@@ -420,6 +532,8 @@ def on_select_source(selection, sources, workspace):
     if selection is None:
         return None, None, ""
     try:
+        if not isinstance(selection, str) or selection not in {str(index) for index in range(len(sources or []))}:
+            return (gr.skip(),) * 3
         index = int(selection)
         if index < 0 or index >= len(sources or []):
             raise ValueError("Select an available reference.")
@@ -441,6 +555,13 @@ def preview_document(path, **kwargs):
 
 
 def on_review_selection(document_id, operation_state):
+    if (operation_state.get("switching", False)
+            or document_id is not None and (
+                not isinstance(document_id, str)
+                or document_id not in operation_state.get("review_document_ids", []))):
+        return (gr.skip(),) * VIEWER_OUTPUT_COUNT
+    if "review_document_id" in operation_state and operation_state["review_document_id"] == document_id:
+        return (gr.skip(),) * VIEWER_OUTPUT_COUNT
     operation_state["review_document_id"] = document_id
     return _reset_viewer(operation_state, "Opening document..." if document_id else "")
 
@@ -450,6 +571,9 @@ def on_preview_document(document_id, unit, sheet, workspace, operation_state):
     if operation_state.get("switching", False):
         return (gr.skip(),) * (VIEWER_OUTPUT_COUNT - 1) + ("Wait for the workspace to open.",)
     if operation_state.get("review_document_id", document_id) != document_id:
+        return (gr.skip(),) * VIEWER_OUTPUT_COUNT
+    if (sheet is not None and "viewer_sheets" in operation_state
+            and sheet not in operation_state["viewer_sheets"]):
         return (gr.skip(),) * VIEWER_OUTPUT_COUNT
     operation_state["viewer_revision"] = operation_state.get("viewer_revision", 0) + 1
     viewer_revision = operation_state["viewer_revision"]
@@ -480,6 +604,11 @@ def on_preview_document(document_id, unit, sheet, workspace, operation_state):
         frame = pd.DataFrame(preview.table, columns=preview.headers or None)
         state = {"workspace": workspace, "document_id": document_id,
                  "unit": preview.unit, "sheet": preview.sheet}
+        operation_state["viewer_sheets"] = list(preview.sheets)
+        if preview.image is not None or preview.html or preview.table or preview.headers or preview.text:
+            operation_state["review_loaded"] = (workspace, document_id, viewer_revision)
+        else:
+            operation_state.pop("review_loaded", None)
         return (state, path, gr.update(value=preview.image, visible=preview.image is not None),
                 gr.update(value=preview.html, visible=bool(preview.html)),
                 gr.update(value=frame, visible=bool(preview.table or preview.headers)),
@@ -496,6 +625,12 @@ def on_preview_document(document_id, unit, sheet, workspace, operation_state):
 
 
 def on_review_document(document_id, workspace, operation_state):
+    # Dropdown also emits input when it merely loses focus. Preserve the
+    # displayed page/sheet once this document and viewer revision are loaded.
+    if (document_id and not operation_state.get("switching", False)
+            and operation_state.get("review_loaded") == (
+                workspace, document_id, operation_state.get("viewer_revision", 0))):
+        return (gr.skip(),) * VIEWER_OUTPUT_COUNT
     return on_preview_document(document_id, 1, None, workspace, operation_state)
 
 
@@ -561,7 +696,7 @@ def build_tab():
     with gr.Row() as outer_row:
         with gr.Column(scale=1) as sources_column:
             workspace_name = gr.Dropdown(label="Workspace", choices=[], allow_custom_value=True,
-                                         info="Choose a saved workspace or type a new name, then open it.")
+                                         info="Selecting a workspace opens it. Type a new name and press Enter to create it.")
             workspace_button = gr.Button("Create / Open workspace", variant="primary")
             workspace_status = gr.Markdown("Opening workspace...")
             with gr.Accordion("Sources", open=True):
@@ -634,8 +769,20 @@ def build_tab():
                             choices=_efforts or [model_config.NO_REASONING_EFFORT],
                             value="medium" if "medium" in _efforts else model_config.NO_REASONING_EFFORT,
                             interactive=bool(_efforts))
+                        web_search = gr.Dropdown(label="Web search", value=model_config.WEB_SEARCH_OFF,
+                            choices=model_config.WEB_SEARCH_CONTEXT_CHOICES,
+                            interactive=model_config.supports_web_search(model_config.DEFAULT_MODEL),
+                            info="Optional web evidence supplements the selected documents; web links appear in the answer.")
+                        stream_output = gr.Checkbox(label="Stream responses", value=True,
+                            interactive=model_config.supports_streaming(model_config.DEFAULT_MODEL))
+                        _sampling = model_config.supports_temperature(model_config.DEFAULT_MODEL, reasoning_effort.value)
+                        temperature = gr.Slider(label="Temperature", minimum=0, maximum=2, step=0.1,
+                            value=1, interactive=_sampling)
+                        top_p = gr.Slider(label="Top-p", minimum=0, maximum=1, step=0.01,
+                            value=1, interactive=_sampling)
                         gr.Markdown("The assistant is instructed to use the selected sources, cite evidence, "
-                                    "and say when evidence is insufficient.")
+                                    "and say when evidence is insufficient. Sampling controls are available "
+                                    "only for supported model and reasoning settings.")
                 with gr.Column(scale=1) as details_column:
                     with gr.Group() as history_column:
                         saved_chat = gr.Dropdown(label="Saved RAG chats", choices=[])
@@ -650,11 +797,14 @@ def build_tab():
                         source_selector = gr.Dropdown(label="Open reference", choices=[])
                         original_file = gr.File(label="Original document", interactive=False)
                         source_image = gr.Image(label="Source page or image", interactive=False)
-                        source_text = gr.Textbox(label="Source excerpt", lines=12, interactive=False)
+                        source_text = gr.Textbox(label="Source excerpt", lines=6, max_lines=6, interactive=False)
             with gr.Row() as bottom_row:
                 with gr.Column(scale=1) as tools_column:
                     with gr.Accordion("Tools", open=True):
-                        gr.Markdown("Workspace tools will appear here in a future update.")
+                        from .tools.ui import (build_tools, on_reset as reset_tools,
+                                               on_workspace_reset, on_selection_changed)
+                        tools = build_tools(workspace_state, document_filter, collection_filter,
+                                            model, reasoning_effort, operation_state)
 
     answer_outputs = [history_state, chatbot, sources_state, sources_table, source_selector,
                       question, status, original_file, source_image, source_text, pending_state]
@@ -670,17 +820,22 @@ def build_tab():
     # invalidate it immediately without waiting for an Office/PDF converter.
     _storage_queue = {"concurrency_id": "rag-workspace-storage", "concurrency_limit": 1}
     _viewer_queue = {"concurrency_id": "rag-document-viewer", "concurrency_limit": 1}
+    # Dynamic dropdowns dispatch input on blur, including delayed values from
+    # before a refresh/workspace switch. For these primitive-only callbacks,
+    # validate against current session/catalog data inside the handler, so a
+    # stale value can be discarded before reading files. Keep File uploads,
+    # dataframes, model controls and generation requests normally preprocessed.
     _viewer_inputs = [review_document, viewer_unit, viewer_sheet, workspace_state, operation_state]
     review_selection_event = review_document.input(on_review_selection,
-        [review_document, operation_state], viewer_outputs, queue=False, trigger_mode="always_last")
+        [review_document, operation_state], viewer_outputs, queue=False, trigger_mode="always_last", preprocess=False)
     review_event = review_selection_event.then(on_review_document,
         [review_document, workspace_state, operation_state], viewer_outputs,
-        trigger_mode="always_last", **_viewer_queue)
-    viewer_unit_event = viewer_unit.submit(on_preview_document, _viewer_inputs, viewer_outputs, **_viewer_queue)
-    viewer_previous_event = viewer_previous.click(on_preview_previous, _viewer_inputs, viewer_outputs, **_viewer_queue)
-    viewer_next_event = viewer_next.click(on_preview_next, _viewer_inputs, viewer_outputs, **_viewer_queue)
+        trigger_mode="always_last", preprocess=False, **_viewer_queue)
+    viewer_unit_event = viewer_unit.submit(on_preview_document, _viewer_inputs, viewer_outputs, preprocess=False, **_viewer_queue)
+    viewer_previous_event = viewer_previous.click(on_preview_previous, _viewer_inputs, viewer_outputs, preprocess=False, **_viewer_queue)
+    viewer_next_event = viewer_next.click(on_preview_next, _viewer_inputs, viewer_outputs, preprocess=False, **_viewer_queue)
     viewer_sheet_event = viewer_sheet.input(on_preview_sheet,
-        [review_document, viewer_sheet, workspace_state, operation_state], viewer_outputs, **_viewer_queue)
+        [review_document, viewer_sheet, workspace_state, operation_state], viewer_outputs, preprocess=False, **_viewer_queue)
     viewer_events = [review_event, viewer_unit_event, viewer_previous_event, viewer_next_event, viewer_sheet_event]
     # A cancellation request can arrive after this input's chained preview.
     # Leave preview jobs queued: their selection/revision guards reject stale
@@ -688,54 +843,72 @@ def build_tab():
     review_document.input(fn=None, cancels=viewer_events[1:], queue=False)
     send_event = gr.on(triggers=[question.submit, send_button.click], fn=on_answer,
                       inputs=[question, history_state, collection_filter, document_filter,
-                              model, reasoning_effort, workspace_state, operation_state],
+                              model, reasoning_effort, workspace_state, operation_state,
+                              web_search, stream_output, temperature, top_p],
                       outputs=answer_outputs, trigger_mode="once", concurrency_limit=1)
     document_filter.input(on_source_selection,
         [document_filter, operation_state, history_state, pending_state], answer_outputs,
         queue=False, cancels=[send_event], trigger_mode="always_last")
+    document_filter.input(on_selection_changed, operation_state, tools.statuses, queue=False)
     select_all_sources_button.click(on_select_all_sources,
         [workspace_state, collection_filter, operation_state, history_state, pending_state],
         [document_filter, *answer_outputs], queue=False, cancels=[send_event])
     clear_sources_button.click(on_clear_sources, [operation_state, history_state, pending_state],
         [document_filter, *answer_outputs], queue=False, cancels=[send_event])
+    select_all_sources_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
+    clear_sources_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
+    delete_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
     stop_button.click(on_stop_chat, [history_state, pending_state], answer_outputs, cancels=[send_event])
     new_chat_button.click(on_new_chat, outputs=answer_outputs, cancels=[send_event])
     toggle_history_column_button.click(on_toggle_history, history_column_state,
                                        [history_column, history_column_state])
     model.change(on_model_change, model, reasoning_effort)
+    model.change(on_web_search_model_change, model, web_search, queue=False)
+    gr.on(triggers=[model.change, reasoning_effort.change], fn=on_generation_options_change,
+          inputs=[model, reasoning_effort], outputs=[temperature, top_p, stream_output], queue=False)
     refresh_button.click(on_refresh, [workspace_state, collection_filter, document_filter,
-                                     review_document, operation_state], library_outputs, **_storage_queue)
-    upload.change(on_upload_change,
-        [upload, upload_filename, upload_selector, upload_editor_path, upload_names_state],
+                                     review_document, operation_state], library_outputs, preprocess=False, **_storage_queue)
+    upload.change(on_upload_files_change,
+        [upload, upload_filename, upload_editor_path, upload_names_state],
         [upload_names_state, upload_filename, upload_selector, upload_editor_path], queue=False)
     upload_filename.input(on_upload_name, [upload_filename, upload_editor_path, upload_names_state],
                           upload_names_state, queue=False, trigger_mode="always_last")
     upload_selector.input(on_upload_selection,
         [upload_selector, upload_filename, upload_editor_path, upload_names_state],
-        [upload_names_state, upload_filename, upload_editor_path], queue=False, trigger_mode="always_last")
-    index_event = index_button.click(on_index, [upload, index_collection, use_vision,
-                                              workspace_state, operation_state, review_document,
-                                              upload_filename, upload_names_state, upload_selector, upload_editor_path],
+        [upload_names_state, upload_filename, upload_editor_path], queue=False, trigger_mode="always_last", preprocess=False)
+    index_event = index_button.click(on_index_uploads, [upload, index_collection, use_vision,
+                                              workspace_state, operation_state,
+                                              upload_filename, upload_names_state, upload_editor_path],
                                     [index_status, library_table, collection_filter, document_filter, *review_outputs])
     index_stop_button.click(on_stop_index, workspace_state, index_status,
                             cancels=[index_event], queue=False)
     delete_button.click(on_delete_documents, [document_filter, collection_filter, workspace_state,
-                                             review_document, operation_state], library_outputs, **_storage_queue)
+                                             review_document, operation_state], library_outputs, preprocess=False, **_storage_queue)
     source_selector.input(on_select_source, [source_selector, sources_state, workspace_state],
-                          [original_file, source_image, source_text], **_storage_queue)
+                          [original_file, source_image, source_text], preprocess=False, **_storage_queue)
     save_button.click(on_save_chat, [history_state, chat_name, workspace_state],
                       [save_status, saved_chat], **_storage_queue)
     load_button.click(on_load_chat, [saved_chat, history_state, pending_state, workspace_state],
-                      answer_outputs, cancels=[send_event], **_storage_queue)
+                      answer_outputs, cancels=[send_event], preprocess=False, **_storage_queue)
+    # Unlike change, input ignores programmatic values, but Gradio also emits
+    # input on unchanged blur. Guard that before invalidating any session work.
+    workspace_selection_event = workspace_name.input(on_workspace_selection,
+        [workspace_name, workspace_state, history_state, pending_state, operation_state],
+        [*workspace_outputs, *tools.outputs, operation_state, workspace_button],
+        trigger_mode="always_last", **_storage_queue)
     workspace_cancel_event = workspace_button.click(on_prepare_workspace_switch,
-        [workspace_state, operation_state], [operation_state, workspace_status, workspace_button],
+        [workspace_state, operation_state], [operation_state, workspace_status, workspace_button, workspace_name],
         cancels=[send_event, index_event, *viewer_events], queue=False)
     workspace_open_event = workspace_cancel_event.then(on_open_workspace,
         [workspace_name, workspace_state, history_state, pending_state, operation_state],
         workspace_outputs, **_storage_queue)
-    workspace_ready_event = workspace_open_event.then(on_finish_workspace_switch, operation_state,
-        [operation_state, workspace_button], queue=False)
+    workspace_tools_event = workspace_open_event.then(on_workspace_reset, [workspace_state, operation_state],
+                                                       tools.outputs, **_storage_queue)
+    workspace_ready_event = workspace_tools_event.then(on_finish_workspace_switch, operation_state,
+        [operation_state, workspace_button, workspace_name], queue=False)
     load_event = get_blocks_context().root_block.load(on_initial_load, inputs=[operation_state],
                                                      outputs=workspace_outputs, **_storage_queue)
+    tools_load_event = load_event.then(reset_tools, [workspace_state, operation_state],
+                                      tools.outputs, **_storage_queue)
     return SimpleNamespace(**{name: value for name, value in locals().items()
                               if not name.startswith("_")})

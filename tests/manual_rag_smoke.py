@@ -48,6 +48,13 @@ def main():
             yield "The launch date is "
             yield f"{date} [1]."
 
+        def send_answer(model, history, **kwargs):
+            assert kwargs["web_search"] == "medium"
+            assert kwargs["temperature"] == 0.4 and kwargs["top_p"] == 0.8
+            assert "Document evidence" not in history[-1]["content"] or "[]" in history[-1]["content"]
+            calls["answers"] += 1
+            return "Web-only reply from [OpenAI](https://openai.com/)."
+
         services = {}
 
         def get_service(workspace):
@@ -55,7 +62,8 @@ def main():
                 settings = Settings(data_dir=workspaces.workspace_path(workspace),
                                     embedding_dimensions=8, chunk_size=80, chunk_overlap=10)
                 store = LibraryStore(settings, vector_client=QdrantClient(":memory:"))
-                services[workspace] = RAGService(settings, store=store, embedder=embed, streamer=answer)
+                services[workspace] = RAGService(settings, store=store, embedder=embed,
+                                                  streamer=answer, sender=send_answer)
             return services[workspace]
 
         ui.get_service = get_service
@@ -71,11 +79,24 @@ def main():
             client = Client(app.local_url, verbose=False, download_files=root / "downloads")
 
             def call(function, *args):
-                result = client.predict(*args, api_name="/" + names[function])
+                job = client.submit(*args, api_name="/" + names[function])
+                job.result()
                 block = next(item for item in app.fns.values() if item.fn is function)
                 outputs = [component for component in block.outputs if not component.skip_api]
-                values = result if len(outputs) != 1 else (result,)
-                return {component._id: value for component, value in zip(outputs, values)}
+                merged = {}
+                for result in job.outputs():
+                    values = result if len(outputs) != 1 else (result,)
+                    for component, value in zip(outputs, values):
+                        if value == {"__type__": "update", "props": {"__type__": "update"}}:
+                            continue
+                        if isinstance(value, dict) and value.get("__type__") == "update":
+                            if isinstance(merged.get(component._id), dict):
+                                merged[component._id] = {**merged[component._id], **value}
+                            elif len(value) > 1:
+                                merged[component._id] = value
+                        else:
+                            merged[component._id] = value
+                return merged
 
             controls = app.rag_tab
             call(ui.on_initial_load)
@@ -110,7 +131,7 @@ def main():
                 other_date = "July 2" if date == "June 1" else "June 1"
                 decoy.write_text(f"A different project launches on {other_date}.\n", encoding="utf-8")
                 files = [handle_file(str(document)), handle_file(str(decoy))]
-                uploads = call(ui.on_upload_change, files, "", None, "")
+                uploads = call(ui.on_upload_files_change, files, "", "")
                 assert uploads[controls.upload_filename._id]["value"] == document.name
                 choices = uploads[controls.upload_selector._id]["choices"]
                 owner, other_owner = choices[0][1], choices[1][1]
@@ -123,7 +144,7 @@ def main():
                 # Index must read this last textbox edit even without a separate
                 # filename-input RPC first.
                 renamed = f"{workspace} final launch.txt"
-                indexed = call(ui.on_index, files, "Default", False, None, renamed, owner, owner)
+                indexed = call(ui.on_index_uploads, files, "Default", False, renamed, owner)
                 rows = indexed[controls.library_table._id]["data"]
                 assert len(rows) == 2 and all(row[1] == "ready" for row in rows), rows
                 assert {row[0] for row in rows} == {renamed, "Unselected project.txt"}
@@ -220,17 +241,36 @@ def main():
             assert controls.workspace_state in save_function.inputs
             rejected = ui.on_select_source("0", saved_sources["Alpha"], "Beta")
             assert rejected[:2] == (None, None) and "outside the document library" in rejected[2]
-            call(ui.on_prepare_workspace_switch)
-            call(ui.on_open_workspace, "Alpha")
-            call(ui.on_finish_workspace_switch)
+            switched = call(ui.on_workspace_selection, "Alpha")
+            assert switched[controls.workspace_name._id]["value"] == "Alpha"
+            assert switched[controls.workspace_name._id]["interactive"] is True
+            # A delayed blur from the old workspace must reach our canonical
+            # selection guard, not fail in Gradio's stale choice preprocessor.
+            stale_selection = call(ui.on_review_selection, workbook_document["id"])
+            assert not stale_selection, stale_selection
+            assert not call(ui.on_review_document, workbook_document["id"])
+            assert not call(ui.on_preview_sheet, workbook_document["id"], "Second")
+            assert not call(ui.on_upload_selection, "File", "old name.xlsx", "old-upload")
+            assert not call(ui.on_select_source, "File")
             loaded = call(ui.on_load_chat, "RPC smoke chat")
             assert "June 1 [1]" in str(loaded[controls.chatbot._id])
             assert "July 2" not in str(loaded[controls.chatbot._id])
-            assert calls["embeddings"] >= 4 and calls["answers"] == 2, calls
+            unchanged = call(ui.on_workspace_selection, "Alpha")
+            assert controls.chatbot._id not in unchanged
+            before_web = calls["embeddings"]
+            web_answer = call(ui.on_answer, "Search the web", "Default", [], "gpt-4o", "auto",
+                              "medium", False, 0.4, 0.8)
+            assert "Web-only reply" in str(web_answer[controls.chatbot._id])
+            assert web_answer[controls.sources_table._id]["data"] == []
+            assert calls["embeddings"] == before_web
+            assert calls["embeddings"] >= 4 and calls["answers"] == 3, calls
             print("PASS: one-session HTTP upload/index/document review/answer/citation/save/load in two isolated workspaces")
             print("PASS: workspace switching clears chat/upload/references; same chat names remain isolated")
+            print("PASS: automatic workspace selection opens immediately; unchanged selection leaves chat intact")
+            print("PASS: delayed file/sheet/reference selections after a workspace switch are safely ignored")
             print("PASS: original PDF page images and spreadsheet sheet switching render through RPC")
             print("PASS: per-upload names reach citations; checked sources scope answers; empty checks make no API calls")
+            print("PASS: optional web-only reply uses blocking generation and the selected sampling values")
             print("Fake model calls:", json.dumps(calls), "Paid API calls: 0")
         finally:
             if client is not None:

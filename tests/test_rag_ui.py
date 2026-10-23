@@ -34,7 +34,9 @@ def service(ui, monkeypatch, tmp_path):
 
 
 def _source(tmp_path):
-    original = tmp_path / "report.txt"
+    directory = tmp_path / "sources"
+    directory.mkdir(exist_ok=True)
+    original = directory / "report.txt"
     original.write_text("The launch date is June 1.", encoding="utf8")
     return {"number": 1, "document_id": "ready-1", "filename": "report.txt",
             "locator": "paragraph 1", "text": "The launch date is June 1.",
@@ -53,7 +55,8 @@ def test_root_tabs_build_without_initializing_rag(ui, monkeypatch):
     app = host.create_app()
     tabs = [component["props"]["label"] for component in app.config["components"]
             if component["type"] == "tabitem"]
-    assert tabs == ["Chat", "RAG Chat"]
+    assert tabs == ["Chat", "RAG Chat", "Summary", "Spreadsheet", "Presentation", "Graphics", "Plot", "Mind Map", "Flashcards",
+                    "Quizzes", "Compare", "Evidence Check", "Plugins"]
     assert app.chat_tab.state is not app.rag_tab.history_state
     assert app.rag_tab.history_state is not app.rag_tab.sources_state
     assert app.chat_tab.send_event["id"] != app.rag_tab.send_event["id"]
@@ -99,6 +102,44 @@ def test_answer_preserves_source_metadata_but_only_renders_chat_content(ui, serv
     assert calls[0][3]["document_ids"] == ["ready-1"]
     assert question == ui.gr.skip()
     assert preview == [None, None, "", None]
+
+
+def test_web_answer_can_use_empty_local_selection_and_forwards_generation_options(ui, service):
+    calls = []
+
+    def answer(question, history, collection, **kwargs):
+        calls.append(kwargs)
+        yield [{"role": "assistant", "content": "Web answer", "sources": [], "web_search": True}], []
+
+    service.answer = answer
+    result = list(ui.on_answer("Latest news?", [], "Default", [], "gpt-4o", "auto", "Default",
+                              {"revision": 0}, "high", False, 0.3, 0.7))
+    assert result[-1][0][0]["content"] == "Web answer"
+    assert calls == [{"document_ids": [], "model": "gpt-4o", "reasoning_effort": "auto",
+                      "web_search": "high", "stream_output": False, "temperature": 0.3, "top_p": 0.7}]
+
+
+@pytest.mark.parametrize("model,effort,sampling", [
+    ("gpt-4o", "auto", True), ("gpt-6-luna", "medium", False),
+    ("gpt-6-luna", "none", True), ("gpt-6.1-sol", "medium", False),
+])
+def test_rag_sampling_controls_follow_shared_capabilities(ui, model, effort, sampling):
+    temperature, top_p, stream = ui.on_generation_options_change(model, effort)
+    assert temperature["interactive"] is sampling and top_p["interactive"] is sampling
+    assert stream["interactive"] is ui.model_config.supports_streaming(model)
+
+
+def test_rag_web_control_resets_when_switching_to_unsupported_model(ui):
+    unsupported = next(model for model in ui.model_config.MODEL_CHOICES
+                       if not ui.model_config.supports_web_search(model))
+    update = ui.on_web_search_model_change(unsupported)
+    assert update["value"] == ui.model_config.WEB_SEARCH_OFF and not update["interactive"]
+
+
+def test_rag_nonstreaming_model_disables_stream_checkbox(ui):
+    model = next(model for model in ui.model_config.MODEL_CHOICES
+                 if not ui.model_config.supports_streaming(model))
+    assert ui.on_generation_options_change(model, "auto")[2] == ui.gr.update(interactive=False, value=False)
 
 
 def test_failed_answer_rolls_back_state_without_overwriting_new_draft(ui, service):
@@ -188,7 +229,11 @@ def test_reference_previews_are_limited_to_the_library(ui, service, tmp_path):
     original, image, excerpt = ui.on_select_source("0", [unsafe], "Default")
     assert original is None and image is None
     assert "outside the document library" in excerpt
-    assert ui.on_select_source("-1", [source], "Default")[:2] == (None, None)
+    assert ui.on_select_source("-1", [source], "Default") == (ui.gr.skip(),) * 3
+    internal = tmp_path / "library.sqlite3"
+    internal.write_text("private workspace metadata", encoding="utf-8")
+    result = ui.on_select_source("0", [dict(source, source_path=str(internal))], "Default")
+    assert result[:2] == (None, None) and "outside the document library" in result[2]
 
 
 def test_saved_chat_restores_sources_and_failed_load_keeps_current_chat(ui, service, monkeypatch, tmp_path):
@@ -275,10 +320,14 @@ def test_workspace_layout_and_event_scope(ui, monkeypatch):
         controls.send_event["id"], controls.index_event["id"],
         *(event["id"] for event in controls.viewer_events)])
     assert cancellation["targets"] == [(controls.workspace_button._id, "click")]
+    assert controls.workspace_selection_event["targets"] == [(controls.workspace_name._id, "input")]
+    assert controls.workspace_selection_event["trigger_mode"] == "always_last"
+    assert not controls.workspace_selection_event["cancels"]
     assert controls.workspace_open_event["trigger_after"] == controls.workspace_cancel_event["id"]
-    assert controls.workspace_ready_event["trigger_after"] == controls.workspace_open_event["id"]
+    assert controls.workspace_tools_event["trigger_after"] == controls.workspace_open_event["id"]
+    assert controls.workspace_ready_event["trigger_after"] == controls.workspace_tools_event["id"]
     functions = {fn.fn: fn for fn in app.fns.values() if fn.fn is not None}
-    for callback in (ui.on_answer, ui.on_index, ui.on_refresh, ui.on_select_source,
+    for callback in (ui.on_answer, ui.on_index_uploads, ui.on_refresh, ui.on_select_source,
                      ui.on_save_chat, ui.on_load_chat, ui.on_delete_documents, ui.on_stop_index,
                      ui.on_review_document, ui.on_preview_document):
         assert controls.workspace_state in functions[callback].inputs
@@ -289,9 +338,21 @@ def test_workspace_layout_and_event_scope(ui, monkeypatch):
     assert controls.viewer_state in functions[ui.on_open_workspace].outputs
     assert functions[ui.on_review_document].concurrency_id != functions[ui.on_open_workspace].concurrency_id
     assert controls.viewer_image not in functions[ui.on_answer].outputs
-    assert controls.upload_filename in functions[ui.on_index].inputs
-    assert controls.upload_editor_path in functions[ui.on_index].inputs
+    assert controls.upload_filename in functions[ui.on_index_uploads].inputs
+    assert controls.upload_editor_path in functions[ui.on_index_uploads].inputs
+    assert controls.upload_selector not in functions[ui.on_index_uploads].inputs
+    assert controls.review_document not in functions[ui.on_index_uploads].inputs
+    assert functions[ui.on_index_uploads].preprocess is True
+    assert functions[ui.on_upload_files_change].preprocess is True
+    assert controls.upload_selector not in functions[ui.on_upload_files_change].inputs
     assert controls.upload_names_state in functions[ui.on_open_workspace].outputs
+    for component in (controls.web_search, controls.stream_output, controls.temperature, controls.top_p):
+        assert component in functions[ui.on_answer].inputs
+    assert controls.web_search.value == ui.model_config.WEB_SEARCH_OFF
+    assert controls.stream_output.value is True
+    assert controls.source_text.lines == controls.source_text.max_lines == 6
+    assert controls.workspace_name in functions[ui.on_prepare_workspace_switch].outputs
+    assert controls.workspace_name in functions[ui.on_finish_workspace_switch].outputs
 
 
 def test_workspace_open_clears_state_and_errors_keep_active(ui, monkeypatch, tmp_path):
@@ -314,11 +375,14 @@ def test_workspace_open_clears_state_and_errors_keep_active(ui, monkeypatch, tmp
         list_chats=lambda *, data_dir: [data_dir.name + " chat"]))
     revision = {"revision": 1, "switching": True}
     result = ui.on_open_workspace("Beta", "Alpha", operation_state=revision)
-    assert revision == {"revision": 2, "switching": True, "viewer_revision": 1, "review_document_id": None, "selected_ids": [], "known_ready_ids": []}
-    ready, button = ui.on_finish_workspace_switch(revision)
+    assert revision == {"revision": 2, "switching": True, "viewer_revision": 1, "review_document_id": None,
+                        "review_document_ids": [], "viewer_sheets": [], "selected_ids": [], "known_ready_ids": []}
+    ready, button, dropdown = ui.on_finish_workspace_switch(revision)
     assert ready is revision and revision == {"revision": 3, "switching": False, "viewer_revision": 1,
-                                              "review_document_id": None, "selected_ids": [], "known_ready_ids": []}
+                                              "review_document_id": None, "review_document_ids": [], "viewer_sheets": [],
+                                              "selected_ids": [], "known_ready_ids": []}
     assert button["interactive"] is True
+    assert dropdown["interactive"] is True
     assert len(result) == 24 + ui.REVIEW_OUTPUT_COUNT + ui.UPLOAD_OUTPUT_COUNT
     assert result[0] == "Beta" and result[1]["value"] == "Beta"
     assert result[5]["value"] == []  # document selection
@@ -344,6 +408,78 @@ def test_work_submitted_during_workspace_switch_does_not_start(ui, monkeypatch):
     assert len(indexed) == 1 and "Wait for the workspace" in indexed[0][0]
 
 
+def test_late_workspace_open_cannot_publish_or_unlock_a_newer_switch(ui, monkeypatch, tmp_path):
+    operation = {"revision": 1, "switching": True, "workspace_open_pending": True}
+    service = SimpleNamespace(settings=SimpleNamespace(data_dir=tmp_path, fingerprint=lambda: "v1"),
+        store=SimpleNamespace(collections=lambda: [], list_documents=lambda collection=None: []))
+    monkeypatch.setattr(ui, "get_service", lambda workspace: service)
+    monkeypatch.setattr(ui, "_workspaces", lambda: SimpleNamespace(
+        workspace_path=lambda name, create=False: tmp_path / name, list_workspaces=lambda: ["Alpha", "Beta"]))
+
+    def list_chats(**kwargs):
+        operation["revision"] += 1  # Another selection arrived while the old catalog was opening.
+        return []
+
+    monkeypatch.setattr(ui, "_history_store", lambda: SimpleNamespace(list_chats=list_chats))
+    result = ui.on_open_workspace("Alpha", "Default", operation_state=operation)
+    assert all(item == ui.gr.skip() for item in result)
+    assert operation == {"revision": 2, "switching": True, "workspace_open_pending": True}
+    ready, button, dropdown = ui.on_finish_workspace_switch(operation)
+    assert ready["switching"] is True
+    assert not button["interactive"] and not dropdown["interactive"]
+
+
+@pytest.mark.parametrize("name", ["Alpha", "alpha", " Alpha ", "", None])
+def test_unchanged_workspace_dropdown_blur_does_not_cancel_or_reset_chat(ui, monkeypatch, name):
+    def unexpected(*args):
+        pytest.fail("Unchanged dropdown input must preserve active jobs and unsaved chat")
+
+    monkeypatch.setattr(ui, "on_prepare_workspace_switch", unexpected)
+    operation = {"revision": 5, "switching": False}
+    result = list(ui.on_workspace_selection(name, "Alpha", [{"role": "user", "content": "Keep me"}],
+                                            {"question": "Running question"}, operation))
+    assert len(result) == 1 and all(value == ui.gr.skip() for value in result[0])
+    assert operation == {"revision": 5, "switching": False}
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_automatic_workspace_open_commits_before_enabling_and_preserves_tools_on_error(ui, monkeypatch, success):
+    from rag_chatbot.tools import ui as tools_ui
+
+    operation = {"revision": 0, "switching": False}
+    monkeypatch.setattr(ui, "get_service", lambda workspace: SimpleNamespace(cancel_ingestion=lambda: None))
+    resets = []
+
+    def open_workspace(name, current_workspace, current_history, pending, operation_state):
+        assert operation_state["switching"]
+        operation_state["revision"] += 1
+        operation_state["workspace_open_pending"] = False
+        result = list(ui._workspace_error("Cannot open"))
+        if success:
+            result[0] = name
+            result[1] = ui.gr.update(value=name)
+        return tuple(result)
+
+    def reset(workspace, operation_state):
+        assert operation_state["switching"]
+        resets.append(workspace)
+        return (ui.gr.skip(),) * tools_ui.TOTAL_OUTPUT_COUNT
+
+    monkeypatch.setattr(ui, "on_open_workspace", open_workspace)
+    monkeypatch.setattr(tools_ui, "on_workspace_reset", reset)
+    stream = ui.on_workspace_selection("Beta", "Alpha", [], None, operation)
+    preparing = next(stream)
+    assert preparing[1]["interactive"] is False and operation["switching"]
+    committed = next(stream)
+    assert committed[0] == ("Beta" if success else ui.gr.skip())
+    assert operation["switching"] is True  # Server still has to apply this yield's active State.
+    assert resets == (["Beta"] if success else [])
+    ready = next(stream)
+    assert ready[1]["interactive"] is True and operation["switching"] is False
+    assert ready[0] == ui.gr.skip()
+    assert list(stream) == []
+
+
 def test_switch_signals_old_index_and_discards_late_answer(ui, monkeypatch, tmp_path):
     revision = {"revision": 0}
     calls = []
@@ -359,9 +495,10 @@ def test_switch_signals_old_index_and_discards_late_answer(ui, monkeypatch, tmp_
     stream = ui.on_answer("Question", [], "Default", ["ready-1"], "gpt-4o", "auto", "Alpha", revision)
     next(stream)
     next(stream)
-    switched, _, button = ui.on_prepare_workspace_switch("Alpha", revision)
+    switched, _, button, dropdown = ui.on_prepare_workspace_switch("Alpha", revision)
     assert switched is revision and revision["revision"] == 1
     assert button["interactive"] is False
+    assert dropdown["interactive"] is False
     assert list(stream) == []
     assert calls == ["answer Alpha", "cancel Alpha", "closed"]
 
@@ -431,11 +568,51 @@ def test_document_review_resolves_active_id_and_navigation(ui, service, monkeypa
     assert next_page[6]["value"] == 2 and next_page[7] == "Page 2 of 3"
     first_page = ui.on_preview_previous("ready-1", 1, None, "Default", operation)
     assert first_page[6]["value"] == 1
+    operation["viewer_sheets"] = ["Budget", "Summary"]
     sheet = ui.on_preview_sheet("ready-1", "Budget", "Default", operation)
     assert calls[-1][2:] == (1, "Budget")
     assert sheet[4]["visible"] is True and sheet[4]["value"].iloc[0]["Amount"] == 42
     assert sheet[5]["visible"] is False
     assert sheet[8]["choices"] == ["Budget", "Summary"] and sheet[8]["value"] == "Budget"
+
+
+def test_unchanged_document_blur_preserves_displayed_page_and_sheet(ui, service, monkeypatch, tmp_path):
+    original = _source(tmp_path)["source_path"]
+    service.store.get_document = lambda document_id: {"id": document_id, "path": original, "status": "ready"}
+    calls = []
+
+    def preview(path, *, data_dir, unit, sheet):
+        calls.append((unit, sheet))
+        return _preview(unit=unit, sheets=["First", "Second"], sheet=sheet or "First")
+
+    monkeypatch.setattr(ui, "preview_document", preview)
+    operation = {"revision": 0, "review_document_ids": ["ready-1"]}
+    ui.on_review_selection("ready-1", operation)
+    ui.on_review_document("ready-1", "Default", operation)
+    ui.on_preview_sheet("ready-1", "Second", "Default", operation)
+    ui.on_preview_next("ready-1", 1, "Second", "Default", operation)
+    before = list(calls)
+    assert ui.on_review_selection("ready-1", operation) == (ui.gr.skip(),) * ui.VIEWER_OUTPUT_COUNT
+    assert ui.on_review_document("ready-1", "Default", operation) == (ui.gr.skip(),) * ui.VIEWER_OUTPUT_COUNT
+    assert calls == before and calls[-1] == (2, "Second")
+
+    # Explicitly clearing/reselecting the document remains a fresh open.
+    ui.on_review_selection(None, operation)
+    ui.on_review_selection("ready-1", operation)
+    reopened = ui.on_review_document("ready-1", "Default", operation)
+    assert reopened[6]["value"] == 1 and calls[-1] == (1, None)
+
+
+def test_failed_document_preview_can_be_retried(ui, service, monkeypatch, tmp_path):
+    original = _source(tmp_path)["source_path"]
+    service.store.get_document = lambda document_id: {"path": original, "status": "ready"}
+    previews = iter([_preview(text="", status="Preview unavailable"), _preview(text="Recovered")])
+    monkeypatch.setattr(ui, "preview_document", lambda *args, **kwargs: next(previews))
+    operation = {"revision": 0, "review_document_ids": ["ready-1"]}
+    ui.on_review_selection("ready-1", operation)
+    assert ui.on_review_document("ready-1", "Default", operation)[9] == "Preview unavailable"
+    ui.on_review_selection("ready-1", operation)
+    assert ui.on_review_document("ready-1", "Default", operation)[5]["value"] == "Recovered"
 
 
 def test_document_review_rejects_foreign_deleted_and_outside_paths(ui, service, monkeypatch, tmp_path):
@@ -457,7 +634,7 @@ def test_document_review_rejects_foreign_deleted_and_outside_paths(ui, service, 
 def test_document_review_discards_late_results(ui, service, monkeypatch, tmp_path, invalidate):
     document = {"id": "ready-1", "path": _source(tmp_path)["source_path"], "status": "ready"}
     service.store.get_document = lambda document_id: document
-    operation = {"revision": 0}
+    operation = {"revision": 0, "review_document_ids": ["ready-1", "another-source"]}
     def preview(*args, **kwargs):
         if invalidate == "workspace":
             operation["revision"] += 1
@@ -503,7 +680,7 @@ def test_deleting_reviewed_document_clears_viewer(ui, service):
 
 def test_index_completion_preserves_a_newer_review_selection(ui, service):
     service.ingest = lambda *args, **kwargs: iter(["Indexing"])
-    operation = {"revision": 0, "review_document_id": "ready-1"}
+    operation = {"revision": 0, "review_document_id": "ready-1", "review_document_ids": ["ready-1", "failed-2"]}
     stream = ui.on_index(["report.txt"], "Research", False, "Default", operation, "ready-1")
     next(stream)
     ui.on_review_selection("failed-2", operation)
@@ -519,6 +696,70 @@ def test_queued_preview_for_an_old_selection_never_renders(ui, monkeypatch):
     operation = {"revision": 0, "review_document_id": "new-selection"}
     assert ui.on_review_document("old-selection", "Default", operation) == (
         ui.gr.skip(),) * ui.VIEWER_OUTPUT_COUNT
+
+
+def test_stale_dynamic_dropdown_events_reach_canonical_guards(ui, monkeypatch):
+    """Exercise Gradio preprocessing, not just the Python callback directly."""
+    import asyncio
+    from gradio.state_holder import SessionState
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A stale dropdown value must not read a source or initialize storage")
+
+    monkeypatch.setattr(ui, "get_service", unexpected)
+    with ui.gr.Blocks() as app:
+        controls = ui.build_tab()
+    state = SessionState(app)
+    state[controls.workspace_state._id] = "New workspace"
+    state[controls.operation_state._id] = {
+        "revision": 4, "review_document_id": "current", "review_document_ids": ["current"],
+        "viewer_revision": 2, "viewer_sheets": [],
+    }
+    state[controls.upload_names_state._id] = {"names": {}, "selected": None}
+
+    async def invoke(callback, values):
+        function = next(item for item in app.fns.values() if item.fn is callback)
+        result = await app.process_api(function, [values.get(component._id) for component in function.inputs],
+                                       state=state)
+        assert all(value is None if component.stateful else value in (
+                       ui.gr.skip(), {"__type__": "update", "props": ui.gr.skip()})
+                   for component, value in zip(function.outputs, result["data"])), result["data"]
+
+    asyncio.run(invoke(ui.on_review_selection, {controls.review_document._id: "File"}))
+    asyncio.run(invoke(ui.on_review_document, {controls.review_document._id: "File"}))
+    asyncio.run(invoke(ui.on_preview_sheet, {
+        controls.review_document._id: "current", controls.viewer_sheet._id: "File"}))
+    asyncio.run(invoke(ui.on_upload_selection, {controls.upload_selector._id: "File"}))
+    asyncio.run(invoke(ui.on_select_source, {controls.source_selector._id: "File"}))
+    assert state[controls.operation_state._id]["review_document_id"] == "current"
+    assert state[controls.operation_state._id]["viewer_revision"] == 2
+
+    for tool in controls.tools.controls.values():
+        if not hasattr(tool, "reference"):
+            continue
+        function = next(item for item in app.fns.values()
+                        if tool.reference in item.inputs and tool.excerpt in item.outputs)
+        assert function.preprocess is False
+        # No current output after a workspace reset: an old reference number
+        # must not fail against the now-empty dropdown choices.
+        async def invoke_reference():
+            return await app.process_api(function,
+                ["File" if component is tool.reference else None for component in function.inputs], state=state)
+        result = asyncio.run(invoke_reference())
+        assert result["data"] in ([ui.gr.skip(), ui.gr.skip()], ["", None])
+
+
+def test_upload_refresh_and_index_use_session_selection(ui, service):
+    first, second = "/one/report.pdf", "/two/report.pdf"
+    names, _, _, owner = ui.on_upload_files_change([first, second], "", "", {})
+    ui.on_upload_selection(second, "First report.pdf", owner, names)
+    names, filename, _, owner = ui.on_upload_files_change([second], "Second report.pdf", second, names)
+    assert owner == second and filename["value"] == "Second report.pdf"
+    captured = []
+    service.ingest = lambda paths, collection, **kwargs: captured.append(kwargs["display_names"]) or iter([])
+    list(ui.on_index_uploads([second], "Research", False, "Default", {"revision": 0},
+                            "Final report.pdf", names, owner))
+    assert captured == [["Final report.pdf"]]
 
 
 def test_upload_names_are_per_path_and_live_index_edit_is_captured(ui, service):
@@ -639,7 +880,7 @@ def test_new_review_selection_waits_for_old_render_and_then_displays(ui, service
             assert release.wait(timeout=3)
         return _preview()
     monkeypatch.setattr(ui, "preview_document", render)
-    operation = {"revision": 0}
+    operation = {"revision": 0, "review_document_ids": ["first", "second"]}
     ui.on_review_selection("first", operation)
     with ThreadPoolExecutor(max_workers=1) as pool:
         old = pool.submit(ui.on_review_document, "first", "Default", operation)

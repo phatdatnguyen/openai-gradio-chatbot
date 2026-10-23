@@ -32,6 +32,7 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+            plugins/plot/requirements.txt
       - name: Install dependencies
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Check dependency consistency
@@ -40,6 +41,8 @@ jobs:
         run: python -m pytest -q
       - name: Exercise both tabs over localhost
         run: python tests/manual_rag_smoke.py
+      - name: Exercise Studio and Plugins over localhost
+        run: python tests/manual_tools_smoke.py
       - name: Install optional LibreOffice converter
         if: runner.os == 'Linux' && matrix.python == '3.13'
         run: |

@@ -32,7 +32,10 @@ def _directory(data_dir):
 
 
 def list_chats(*, data_dir=None):
-    return sorted((path.stem for path in _directory(data_dir).glob("*.json")), key=str.lower)
+    directory = _directory(data_dir)
+    return sorted((path.stem for path in directory.glob("*.json")
+                   if not path.name.startswith(".pending-") and path.is_file()
+                   and not path.is_symlink() and path.resolve().parent == directory), key=str.lower)
 
 
 def _validate(history):
@@ -44,6 +47,10 @@ def _validate(history):
                 or not isinstance(message.get("content"), str)):
             raise ValueError("Invalid message in RAG history.")
         item = {"role": message["role"], "content": message["content"]}
+        if "web_search" in message:
+            if type(message["web_search"]) is not bool:
+                raise ValueError("Invalid web-search provenance in RAG history.")
+            item["web_search"] = message["web_search"]
         if "sources" in message:
             sources = message["sources"]
             if not isinstance(sources, list):

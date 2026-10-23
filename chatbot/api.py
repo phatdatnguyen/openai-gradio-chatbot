@@ -8,7 +8,10 @@ through ``_build_call()``, so a capability fix lands in exactly one place.
 
 import os
 import math
+import json
+import re
 from email.message import Message
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -23,7 +26,8 @@ from .messages import (
     prepare_chat_messages,
     prepare_responses_input,
 )
-from .tokens import trim_history
+from .tokens import (InputTooLargeError, count_tokens, count_text_tokens,
+                     reserve_for_output, trim_history)
 
 import html2text
 
@@ -242,6 +246,64 @@ def _require_reply(text):
     return text
 
 
+def _annotation_field(annotation, key, default=None):
+    return annotation.get(key, default) if isinstance(annotation, dict) else getattr(annotation, key, default)
+
+
+def _web_citation_link(annotation):
+    if _annotation_field(annotation, "type") != "url_citation":
+        return None
+    url = _annotation_field(annotation, "url")
+    if not isinstance(url, str) or any(ord(character) < 32 or ord(character) == 127 for character in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    title = _annotation_field(annotation, "title")
+    title = title.strip() if isinstance(title, str) and title.strip() else parsed.netloc
+    title = " ".join(title.split())
+    title = re.sub(r"([\\`*_{}\[\]()<>#+.!|])", r"\\\1", title)
+    # Encode Markdown delimiters while retaining ordinary URL syntax and existing
+    # percent escapes. Annotation text cannot create a second link or HTML node.
+    escaped_url = quote(url, safe=":/?#[]@!$&'*,;=%~+-_")
+    return url, f"[{title}]({escaped_url})"
+
+
+def _annotated_response_part(part):
+    text = part.text
+    spans = []
+    for annotation in getattr(part, "annotations", None) or []:
+        citation = _web_citation_link(annotation)
+        start, end = (_annotation_field(annotation, key) for key in ("start_index", "end_index"))
+        if (citation and type(start) is int and type(end) is int and 0 <= start < end <= len(text)):
+            spans.append((start, end, citation[1]))
+    # Offsets refer to the original text, so replace from right to left. Ignore
+    # overlapping invalid annotations; the source appendix still exposes URLs.
+    boundary = len(text)
+    for start, end, link in sorted(spans, reverse=True):
+        if end <= boundary:
+            text = text[:start] + link + text[end:]
+            boundary = start
+    return text
+
+
+def _response_web_sources(response):
+    links, seen = [], set()
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            for annotation in getattr(part, "annotations", None) or []:
+                citation = _web_citation_link(annotation)
+                if citation and citation[0] not in seen:
+                    seen.add(citation[0])
+                    links.append(citation[1])
+    return "\n\nWeb sources:\n\n" + "\n".join(f"- {link}" for link in links) if links else ""
+
+
 def _response_text(response):
     _check_response_status(response)
     parts = []
@@ -250,10 +312,11 @@ def _response_text(response):
             continue
         for part in item.content:
             if part.type == "output_text":
-                parts.append(part.text)
+                parts.append(_annotated_response_part(part))
             elif part.type == "refusal":
                 parts.append(part.refusal)
-    return _require_reply("".join(parts) or getattr(response, "output_text", None))
+    text = _require_reply("".join(parts) or getattr(response, "output_text", None))
+    return text + _response_web_sources(response)
 
 
 def _check_chat_finish(reason):
@@ -281,13 +344,109 @@ def send_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperature=
     return _require_reply(choice.message.content or getattr(choice.message, "refusal", None))
 
 
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("The model returned duplicate JSON keys.")
+        result[key] = value
+    return result
+
+
+def _invalid_json_constant(value):
+    raise ValueError("The model returned a non-finite JSON number.")
+
+
+def _finite_json_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("The model returned an out-of-range JSON number.")
+    return number
+
+
+def generate_structured(model, history, schema, *, schema_name="tool_result",
+                        system_prompt="", reasoning_effort="medium",
+                        max_output_tokens=8000):
+    """Return one strict JSON object for a source-grounded tool.
+
+    Refusals and truncated responses are errors, never successful artifacts. The
+    tool must also validate the resulting structure and citation IDs against its
+    evidence snapshot. This call does not retry with a weaker output format.
+    """
+    if not config.supports_structured_output(model):
+        raise ValueError(
+            f"{model} is not enabled for structured tools. Choose {config.DEFAULT_MODEL} "
+            "or another supported general-purpose model."
+        )
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("A tool output schema must describe a JSON object.")
+    if not isinstance(schema_name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", schema_name):
+        raise ValueError("Invalid tool schema name.")
+    if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= 32768:
+        raise ValueError("Tool output limit must be between 1 and 32768 tokens.")
+    if not history:
+        raise ValueError("A tool request needs source input.")
+    schema_text = json.dumps(schema, ensure_ascii=False, allow_nan=False)
+    system_prompt = normalize_text(system_prompt)
+    # Unlike conversation trimming, a tool must never silently drop source input.
+    # Include schema overhead and the output reserve in this preflight check.
+    prepared = (prepare_responses_input(history) if config.uses_responses_api(model)
+                else prepare_chat_messages(history))
+    needed = count_tokens(prepared, model)
+    overhead = count_text_tokens(system_prompt + schema_text, model) + 256
+    budget = (config.get_max_context_tokens(model)
+              - max(max_output_tokens, reserve_for_output(model)) - overhead)
+    if needed > budget:
+        raise InputTooLargeError(model, needed, max(budget, 0))
+    surface, kwargs = _build_call(
+        model, history, config.WEB_SEARCH_OFF, 1.0, 1.0,
+        system_prompt, reasoning_effort,
+    )
+    format_spec = {"name": schema_name, "schema": schema, "strict": True}
+    client = config.get_client()
+    if surface == RESPONSES_SURFACE:
+        kwargs["text"] = {"format": {"type": "json_schema", **format_spec}}
+        kwargs["max_output_tokens"] = max_output_tokens
+        response = client.responses.create(**kwargs)
+        _check_response_status(response)
+        if getattr(response, "status", "completed") != "completed":
+            raise RuntimeError("The tool response did not complete.")
+        for item in getattr(response, "output", None) or []:
+            for part in getattr(item, "content", None) or []:
+                if getattr(part, "type", None) == "refusal":
+                    raise RuntimeError("The model declined to generate this tool output.")
+        raw = _response_text(response)
+    else:
+        kwargs["response_format"] = {"type": "json_schema", "json_schema": format_spec}
+        kwargs["max_completion_tokens"] = max_output_tokens
+        response = client.chat.completions.create(**kwargs)
+        if not response.choices:
+            raise RuntimeError("The model returned an empty tool response.")
+        choice = response.choices[0]
+        _check_chat_finish(choice.finish_reason)
+        if getattr(choice.message, "refusal", None):
+            raise RuntimeError("The model declined to generate this tool output.")
+        raw = _require_reply(choice.message.content)
+    try:
+        result = json.loads(raw, object_pairs_hook=_json_object,
+                            parse_constant=_invalid_json_constant, parse_float=_finite_json_float)
+    except (ValueError, RecursionError) as exc:
+        raise RuntimeError("The model returned invalid JSON for this tool.") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("The model did not return a tool result object.")
+    return result
+
+
 def stream_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperature=1.0,
-                top_p=1.0, system_prompt="", reasoning_effort=None):
+                top_p=1.0, system_prompt="", reasoning_effort=None, *, final_text_callback=None):
     """Streaming call. Yields text deltas as they arrive."""
     if not config.supports_streaming(llm_model):
         logger.info("%s does not support streaming; waiting for its full reply.", llm_model)
-        yield send_chat(llm_model, history, web_search, temperature, top_p,
-                        system_prompt, reasoning_effort)
+        text = send_chat(llm_model, history, web_search, temperature, top_p,
+                         system_prompt, reasoning_effort)
+        yield text
+        if final_text_callback is not None:
+            final_text_callback(text)
         return
     surface, kwargs = _build_call(
         llm_model, history, web_search, temperature, top_p, system_prompt, reasoning_effort
@@ -312,6 +471,12 @@ def stream_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperatur
             _check_response_status(response)
             if not has_text:
                 yield _response_text(response)
+            else:
+                citations = _response_web_sources(response)
+                if citations:
+                    yield citations
+            if final_text_callback is not None:
+                final_text_callback(_response_text(response))
         return
 
     with client.chat.completions.create(stream=True, **kwargs) as stream:
@@ -335,14 +500,24 @@ def stream_chat(llm_model, history, web_search=config.WEB_SEARCH_OFF, temperatur
             _require_reply("")
 
 
-def generate_image(prompt_text, image_path, image_model, image_size, image_quality,
-                   image_background, image_output_format, image_output_compression,
-                   image_moderation, image_input_fidelity):
-    """Generate or edit an image. Returns the assistant message text.
+def generate_image_asset(prompt_text, image_path, image_model, image_size, image_quality,
+                         image_background, image_output_format, image_output_compression,
+                         image_moderation, image_input_fidelity):
+    """Generate or edit one image and return its data without chat markup.
 
-    Raises RuntimeError when the API returns no image data, rather than the old
-    behaviour of silently doing nothing.
+    The returned mapping contains ``b64_json``, ``output_format`` and optional
+    ``revised_prompt``. Chat and Studio share the same model/option validation.
+    No retry is made when the request fails or does not return an image.
     """
+    compression = config.validate_image_options(
+        image_model, image_size, image_quality, image_background,
+        image_output_format, image_output_compression, image_moderation,
+        image_input_fidelity,
+    )
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        raise ValueError("Enter a prompt for image generation or editing.")
+    if len(prompt_text) > 32000:
+        raise ValueError("Image prompts must contain at most 32,000 characters.")
     client = config.get_client()
 
     image_kwargs = {
@@ -354,18 +529,17 @@ def generate_image(prompt_text, image_path, image_model, image_size, image_quali
         "output_format": image_output_format,
     }
     if image_output_format in config.COMPRESSIBLE_IMAGE_FORMATS:
-        image_kwargs["output_compression"] = int(image_output_compression)
+        image_kwargs["output_compression"] = compression
 
     is_edit = bool(image_path)
     if is_edit:
-        # gpt-image-2 does not take an input_fidelity setting.
-        if image_model != "gpt-image-2":
+        if config.supports_image_input_fidelity(image_model):
             image_kwargs["input_fidelity"] = image_input_fidelity
         logger.info("Editing image with %s", image_model)
         with open(image_path, "rb") as input_image_file:
             response = client.images.edit(image=input_image_file, **image_kwargs)
     else:
-        # images.edit does not accept a moderation setting; images.generate does.
+        # Keep the existing Chat behavior: moderation is sent for generation.
         image_kwargs["moderation"] = image_moderation
         logger.info("Generating image with %s", image_model)
         response = client.images.generate(**image_kwargs)
@@ -373,18 +547,43 @@ def generate_image(prompt_text, image_path, image_model, image_size, image_quali
     image_response = response.data[0] if response.data else None
     base64_image = getattr(image_response, "b64_json", None) if image_response else None
 
-    if not base64_image:
+    if not isinstance(base64_image, str) or not base64_image.strip():
         raise RuntimeError(
             "The image API returned no image. This usually means the prompt was "
             "refused by moderation - try rewording it."
         )
 
+    output_format = getattr(response, "output_format", None) or image_output_format
+    if output_format not in config.IMAGE_OUTPUT_FORMAT_CHOICES:
+        raise RuntimeError("The image API returned an unsupported output format.")
     revised_prompt = getattr(image_response, "revised_prompt", None)
+    if revised_prompt is not None and not isinstance(revised_prompt, str):
+        raise RuntimeError("The image API returned a malformed revised prompt.")
+    return {
+        "b64_json": base64_image,
+        "output_format": output_format,
+        "revised_prompt": revised_prompt,
+    }
+
+
+def generate_image(prompt_text, image_path, image_model, image_size, image_quality,
+                   image_background, image_output_format, image_output_compression,
+                   image_moderation, image_input_fidelity):
+    """Generate or edit an image and return the original Chat display format."""
+    asset = generate_image_asset(
+        prompt_text, image_path, image_model, image_size, image_quality,
+        image_background, image_output_format, image_output_compression,
+        image_moderation, image_input_fidelity,
+    )
+    revised_prompt = asset["revised_prompt"]
+    base64_image = asset["b64_json"]
+    image_output_format = asset["output_format"]
+    is_edit = bool(image_path)
     action_label = "Edited image" if is_edit else "Generated image"
     ai_message = f"{action_label} with `{image_model}`."
     if revised_prompt and revised_prompt != prompt_text:
         ai_message += f"\n\nRevised prompt:\n{revised_prompt}"
     ai_message += f"\n\n![Image](data:image/{image_output_format};base64,{base64_image})"
 
-    logger.debug("Image result: %s", truncate(ai_message, 200))
+    logger.debug("Image result received: model=%s format=%s", image_model, image_output_format)
     return ai_message

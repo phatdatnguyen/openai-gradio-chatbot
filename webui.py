@@ -6,6 +6,7 @@ from chatbot import config
 from chatbot.chatbot import build_tab as build_chat_tab
 from chatbot.log import setup_logging
 from rag_chatbot.chatbot import build_tab as build_rag_tab
+from plugins.ui import build_tab as build_plugins_tab
 
 
 APP_CSS = """
@@ -21,6 +22,27 @@ APP_CSS = """
     overflow-wrap: anywhere;
     min-width: 0;
 }
+.rag-summary-sidebar {
+    justify-content: space-between;
+}
+.rag-summary-preview {
+    overflow-y: auto;
+}
+.rag-quiz-options .wrap {
+    flex-direction: column;
+    flex-wrap: nowrap;
+}
+.rag-quiz-options .wrap > label {
+    width: 100%;
+    box-sizing: border-box;
+}
+.rag-quiz-options .wrap > label > span {
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+.rag-quiz-options input[type="radio"] {
+    flex-shrink: 0;
+}
 """
 
 
@@ -31,8 +53,14 @@ def create_app():
                 chat_tab = build_chat_tab()
             with gr.Tab("RAG Chat"):
                 rag_tab = build_rag_tab()
+            with gr.Tab("Plugins"):
+                plugins_tab = build_plugins_tab()
+        app.load(plugins_tab["refresh_callback"],
+                 outputs=[plugins_tab["catalog"], plugins_tab["status"],
+                          plugins_tab["snapshot"]], queue=False)
     app.chat_tab = chat_tab
     app.rag_tab = rag_tab
+    app.plugins_tab = plugins_tab
     return app
 
 

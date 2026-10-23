@@ -41,6 +41,14 @@ def test_history_names_cannot_escape_the_chat_directory(tmp_path):
     assert history.load_chat("../../outside", data_dir=tmp_path / "rag")[0]["role"] == "user"
 
 
+def test_history_listing_excludes_uncommitted_writes_and_directories(tmp_path):
+    history.save_chat(messages(tmp_path), "Saved chat", data_dir=tmp_path)
+    directory = tmp_path / "chats"
+    (directory / ".pending-in-progress.json").write_text('{"version":', encoding="utf-8")
+    (directory / "not-a-chat.json").mkdir()
+    assert history.list_chats(data_dir=tmp_path) == ["Saved chat"]
+
+
 @pytest.mark.parametrize("value", [
     [], {"version": 2, "messages": []}, {"version": True, "messages": []},
     {"version": 1, "messages": {}},

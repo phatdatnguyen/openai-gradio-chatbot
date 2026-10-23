@@ -94,6 +94,45 @@ def test_hash_collection_and_fingerprint_deduplication(store, tmp_path):
     assert store.collections() == ["biology", "science"]
 
 
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_reupload_repairs_managed_original_without_republishing_index(store, tmp_path, damage):
+    document, chunk = publish(store, tmp_path)
+    original = Path(document["path"])
+    before = store.get_document(document["id"])
+    if damage == "missing":
+        original.unlink()
+    else:
+        original.write_text("A different, corrupted document.", encoding="utf-8")
+    restored = stage(store, tmp_path, text=chunk.text)
+    assert restored["unchanged"] is True
+    assert restored["id"] == document["id"]
+    assert restored["generation"] == before["generation"]
+    assert original.read_text(encoding="utf-8") == chunk.text
+    assert store.search("BRCA1", [1, 0, 0], "science")[0].chunk == chunk
+    assert not list(original.parent.glob(".restore-*"))
+
+
+def test_failed_original_repair_keeps_prior_file_and_catalog(store, tmp_path, monkeypatch):
+    document, chunk = publish(store, tmp_path)
+    original = Path(document["path"])
+    original.write_text("Damaged copy to retain if restoration fails.", encoding="utf-8")
+    before = original.read_bytes()
+    published = store.get_document(document["id"])
+    real_copy = __import__("shutil").copyfile
+
+    def corrupt_copy(source, destination):
+        real_copy(source, destination)
+        Path(destination).write_text("Upload changed during the copy.", encoding="utf-8")
+
+    monkeypatch.setattr("rag_chatbot.store.shutil.copyfile", corrupt_copy)
+    with pytest.raises(ValueError, match="changed during import"):
+        store.stage_document(tmp_path / "paper.txt", "science", store.settings.fingerprint(),
+                             display_name="Rename must roll back.txt")
+    assert original.read_bytes() == before
+    assert store.get_document(document["id"]) == published
+    assert not list(original.parent.glob(".restore-*"))
+
+
 def test_failed_embedding_is_not_visible_and_can_be_retried(store, tmp_path):
     document = stage(store, tmp_path)
     store.fail_document(document["id"], "embedding quota unavailable")
@@ -129,6 +168,16 @@ def test_fingerprint_change_hides_incompatible_index(store, tmp_path):
     assert store.search("BRCA1", [1, 0, 0], "science") == []
     assert store.get_chunk(chunk.id) is None
     assert store.get_document(document["id"])["status"] == "ready"
+
+
+@pytest.mark.parametrize("query_vector", [None, [1, 0, 0]])
+def test_unpublished_generation_is_hidden_from_every_retrieval_path(store, tmp_path, query_vector, monkeypatch):
+    document, chunk = publish(store, tmp_path)
+    with store._db:
+        store._db.execute("UPDATE documents SET generation='' WHERE id=?", (document["id"],))
+    monkeypatch.setattr(store.vector_client, "query_points", lambda *a, **k: pytest.fail("Unpublished dense query"))
+    assert store.get_chunk(chunk.id) is None
+    assert store.search("BRCA1", query_vector, "science") == []
 
 
 def test_stale_generations_cannot_starve_valid_dense_results(store, tmp_path):

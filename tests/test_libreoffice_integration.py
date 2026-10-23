@@ -69,3 +69,42 @@ def test_real_libreoffice_preview_preserves_source_and_reuses_cache(tmp_path, mo
     assert original.read_bytes() == original_bytes
     assert original.stat().st_mtime_ns == original_mtime
     assert not list(preview.parent.glob(".converting-*"))
+
+
+def test_generated_studio_presentation_renders_all_slides_and_text(tmp_path):
+    from rag_chatbot.tools.exports import export_bytes
+
+    workspace = tmp_path / "Studio export"
+    directory = workspace / "sources" / "generated-deck"
+    directory.mkdir(parents=True)
+    original = directory / "Presentation.pptx"
+    titles = ["XRD measurement from the selected source", "Scope and limitations of the reported result"]
+    bullets = [
+        ["The XRD peak was measured at 26.5 degrees.", "The source names the measured sample Alpha."],
+        [f"Finding {index}: The reported result applies to the measured sample; additional experiments are needed to compare other samples."
+         for index in range(1, 5)],
+    ]
+    payload = {
+        "tool_id": "presentation", "title": "Studio export smoke", "model": "offline-model",
+        "content": {"slides": [{"title": title, "bullets": points,
+                                "notes": "Speaker-only explanation.", "source_ids": ["source-1"]}
+                               for title, points in zip(titles, bullets)]},
+        "sources": [{"id": "source-1", "document_id": "document-1", "filename": "measurements.txt",
+                     "locator": "Section 1", "text": "Sample Alpha: 26.5 degrees.",
+                     "source_path": "sources/measurements.txt"}],
+        "documents": [{"id": "document-1"}], "coverage": {"documents": 1, "chunks": 1, "processed_chunks": 1},
+        "settings": {"slide_count": 2},
+    }
+    extension, data = export_bytes(payload, "pptx")
+    assert extension == "pptx"
+    original.write_bytes(data)
+    preview = office_preview.get_pdf_preview(original, data_dir=workspace)
+    pages = PdfReader(preview).pages
+    assert len(pages) == len(titles)
+    for page, title, points in zip(pages, titles, bullets):
+        text = " ".join(page.extract_text().split())
+        assert title in text
+        assert all(point in text for point in points)
+        assert "Speaker-only explanation" not in text
+        assert float(page.mediabox.width) / float(page.mediabox.height) == pytest.approx(16 / 9, rel=0.01)
+    assert original.read_bytes() == data

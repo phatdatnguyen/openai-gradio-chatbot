@@ -1,0 +1,3 @@
+# Local Plot preview and PNG/SVG/PDF export; no GUI or Office installation needed.
+# pip selects a compatible Matplotlib version for Python 3.10+ on each platform.
+matplotlib>=3.10,<4

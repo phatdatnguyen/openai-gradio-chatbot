@@ -277,6 +277,31 @@ REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
 SAMPLING_WITHOUT_REASONING_MODELS = {"gpt-6-luna", "gpt-6-sol"}
 
 IMAGE_MODEL_CONFIGS = {
+    # https://developers.openai.com/api/docs/guides/image-generation
+    "gpt-image-2.5-sunburst": {
+        "size_choices": ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "3840x2160", "2160x3840"],
+        "default_size": "auto",
+        "quality_choices": ["auto", "low", "medium", "high", "xhigh", "max"],
+        "default_quality": "auto",
+        "background_choices": ["auto", "opaque", "transparent"],
+        "default_background": "auto",
+        "input_fidelity_choices": ["high"],
+        "default_input_fidelity": "high",
+        "input_fidelity_interactive": False,
+        "supports_input_fidelity": False,
+    },
+    "gpt-image-2.5-flare": {
+        "size_choices": ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "3840x2160", "2160x3840"],
+        "default_size": "auto",
+        "quality_choices": ["auto", "low", "medium", "high", "xhigh", "max"],
+        "default_quality": "auto",
+        "background_choices": ["auto", "opaque", "transparent"],
+        "default_background": "auto",
+        "input_fidelity_choices": ["high"],
+        "default_input_fidelity": "high",
+        "input_fidelity_interactive": False,
+        "supports_input_fidelity": False,
+    },
     "gpt-image-2": {
         "size_choices": ["auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048", "2048x1152", "3840x2160", "2160x3840"],
         "default_size": "auto",
@@ -287,6 +312,7 @@ IMAGE_MODEL_CONFIGS = {
         "input_fidelity_choices": ["high"],
         "default_input_fidelity": "high",
         "input_fidelity_interactive": False,
+        "supports_input_fidelity": False,
     },
     "gpt-image-1.5": {
         "size_choices": ["auto", "1024x1024", "1536x1024", "1024x1536"],
@@ -298,6 +324,7 @@ IMAGE_MODEL_CONFIGS = {
         "input_fidelity_choices": ["low", "high"],
         "default_input_fidelity": "high",
         "input_fidelity_interactive": True,
+        "supports_input_fidelity": True,
     },
 }
 
@@ -354,7 +381,7 @@ MODEL_CHOICES = [
 ]
 
 DEFAULT_MODEL = "gpt-6-luna"
-DEFAULT_IMAGE_MODEL = "gpt-image-2"
+DEFAULT_IMAGE_MODEL = "gpt-image-2.5-sunburst"
 
 # Unknown models get a modern default rather than the old 4096, which used to
 # crush any newly added model that was missing from MODEL_TOKEN_LIMITS.
@@ -390,6 +417,44 @@ def get_image_model_config(image_model):
     return IMAGE_MODEL_CONFIGS.get(image_model, IMAGE_MODEL_CONFIGS[DEFAULT_IMAGE_MODEL])
 
 
+def supports_image_input_fidelity(image_model):
+    return bool(IMAGE_MODEL_CONFIGS.get(image_model, {}).get("supports_input_fidelity"))
+
+
+def validate_image_options(image_model, image_size, image_quality, image_background,
+                           image_output_format, image_output_compression,
+                           image_moderation, image_input_fidelity):
+    """Validate shared Chat/Graphics settings before paid work.
+
+    Return the integer compression value accepted by the API. Size choices are
+    deliberately limited to the app's presets, including its high-resolution
+    presets; arbitrary client-supplied dimensions are not silently accepted.
+    """
+    if not isinstance(image_model, str) or image_model not in IMAGE_MODEL_CONFIGS:
+        raise ValueError("Select a supported image model.")
+    model_config = IMAGE_MODEL_CONFIGS[image_model]
+    for value, choices, label in (
+        (image_size, model_config["size_choices"], "size"),
+        (image_quality, model_config["quality_choices"], "quality"),
+        (image_background, model_config["background_choices"], "background"),
+        (image_input_fidelity, model_config["input_fidelity_choices"], "input fidelity"),
+    ):
+        if not isinstance(value, str) or value not in choices:
+            raise ValueError(f"The selected image model does not support that {label}.")
+    if image_output_format not in IMAGE_OUTPUT_FORMAT_CHOICES:
+        raise ValueError("Choose PNG, JPEG, or WebP for the image output format.")
+    if image_moderation not in IMAGE_MODERATION_CHOICES:
+        raise ValueError("Choose a supported image moderation setting.")
+    if image_background == "transparent" and image_output_format == "jpeg":
+        raise ValueError("Transparent backgrounds require PNG or WebP output.")
+    if (isinstance(image_output_compression, bool)
+            or not isinstance(image_output_compression, (int, float))
+            or not 0 <= image_output_compression <= 100
+            or image_output_compression != int(image_output_compression)):
+        raise ValueError("Image compression must be a whole number from 0 to 100.")
+    return int(image_output_compression)
+
+
 def get_max_context_tokens(model_name, web_search=False):
     if web_search:
         return MODEL_TOKEN_LIMITS_WITH_WEB_SEARCH.get(model_name, DEFAULT_CONTEXT_TOKENS)
@@ -410,6 +475,21 @@ def supports_web_search(model_name):
 
 def requires_web_search(model_name):
     return model_name in DEEP_RESEARCH_MODELS
+
+
+def supports_structured_output(model_name):
+    """Models enabled for the Studio's strict JSON generation requests.
+
+    Keep legacy, coding-only and mandatory-search models out of this workflow.
+    Source: https://developers.openai.com/api/docs/guides/structured-outputs
+    """
+    if model_name not in MODEL_CHOICES or requires_web_search(model_name):
+        return False
+    if "codex" in model_name:
+        return False
+    return model_name.startswith(("gpt-4o", "gpt-4.1", "gpt-5", "gpt-6")) or (
+        model_name in {"o1", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini"}
+    )
 
 
 def is_reasoning_model(model_name):

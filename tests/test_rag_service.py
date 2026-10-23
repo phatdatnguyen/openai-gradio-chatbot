@@ -9,11 +9,11 @@ from PIL import Image
 import pytest
 from qdrant_client import QdrantClient
 
-from chatbot import api, tokens
+from chatbot import api, config, tokens
 from chatbot.messages import prepare_chat_messages, prepare_responses_input
 from rag_chatbot.config import Settings
 from rag_chatbot.schemas import Chunk, Evidence, SourceElement
-from rag_chatbot.service import RAGService, SYSTEM_PROMPT
+from rag_chatbot.service import RAGService, SYSTEM_PROMPT, WEB_SYSTEM_PROMPT
 from rag_chatbot.store import LibraryStore
 
 
@@ -90,6 +90,45 @@ def test_duplicate_import_does_not_repeat_embeddings(service, tmp_path):
     assert "1 unchanged" in messages[-1]
     assert len(service.embedder.calls) == count
     assert len(service.store.list_documents("science")) == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_reupload_repairs_original_without_more_paid_embeddings(service, tmp_path, monkeypatch, damage):
+    path, document = ingest(service, tmp_path)
+    managed = Path(document["path"])
+    before = path.read_bytes()
+    if damage == "missing":
+        managed.unlink()
+    else:
+        managed.write_text("Unexpected file contents.", encoding="utf-8")
+    monkeypatch.setattr(service.store, "check_connection", lambda: pytest.fail("No vector request needed"))
+    calls = len(service.embedder.calls)
+    progress = list(service.ingest([str(path)], "science"))
+    assert "1 unchanged" in progress[-1]
+    assert managed.read_bytes() == before == path.read_bytes()
+    assert len(service.embedder.calls) == calls
+
+
+def test_unpublished_catalog_generation_does_not_trigger_paid_chat_work(service, tmp_path, monkeypatch):
+    _, document = ingest(service, tmp_path)
+    with service.store._db:
+        service.store._db.execute("UPDATE documents SET generation='' WHERE id=?", (document["id"],))
+    monkeypatch.setattr(service.store, "check_connection", lambda: pytest.fail("No published sources to query"))
+    calls = len(service.embedder.calls)
+    history, sources = list(service.answer("What is its value?", [], "science", model="gpt-4o"))[-1]
+    assert sources == [] and "couldn't find indexed evidence" in history[-1]["content"]
+    assert len(service.embedder.calls) == calls and service.streamer.calls == []
+
+
+def test_reupload_republishes_missing_generation_using_paid_cache(service, tmp_path):
+    path, document = ingest(service, tmp_path)
+    with service.store._db:
+        service.store._db.execute("UPDATE documents SET generation='' WHERE id=?", (document["id"],))
+    calls = len(service.embedder.calls)
+    assert "1 indexed" in list(service.ingest([str(path)], "science"))[-1]
+    restored = service.store.get_document(document["id"])
+    assert restored["status"] == "ready" and restored["generation"]
+    assert len(service.embedder.calls) == calls
 
 
 def test_injected_store_supplies_settings_when_not_repeated(service):
@@ -398,3 +437,120 @@ def test_prior_source_snapshots_are_not_replayed_as_new_evidence(service, tmp_pa
     request = service.streamer.calls[-1][1]
     assert all("sources" not in message for message in request)
     assert "OLD SECRET PASSAGE" not in str(request)
+
+
+def test_nonstream_uses_injected_sender_and_forwards_sampling(service, tmp_path):
+    ingest(service, tmp_path)
+    calls = []
+    def send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "Measured value is 7 [1]."
+    service.sender = send
+    replies = list(service.answer("What is the result?", [], "science", model="gpt-4o",
+                                  stream_output=False, temperature=0.4, top_p=0.7))
+    assert len(replies) == 1
+    assert replies[0][0][-1]["content"] == "Measured value is 7 [1]."
+    assert not service.streamer.calls
+    assert calls[0][1]["temperature"] == 0.4
+    assert calls[0][1]["top_p"] == 0.7
+    assert calls[0][1]["web_search"] == config.WEB_SEARCH_OFF
+    assert "final_text_callback" not in calls[0][1]
+
+
+def test_web_only_answer_does_not_query_unselected_library(service, tmp_path, monkeypatch):
+    ingest(service, tmp_path, text="Private selected-only content")
+    embedding_calls = len(service.embedder.calls)
+    monkeypatch.setattr(service.store, "check_connection", lambda: pytest.fail("No selected sources: no Qdrant"))
+    service.streamer = Stream("Web finding [Research](https://example.org/research).")
+    updated, sources = list(service.answer("Find current research", [], "science", [], model="gpt-4o",
+                                           web_search="medium"))[-1]
+    assert sources == []
+    assert len(service.embedder.calls) == embedding_calls
+    assert updated[-1]["web_search"] is True
+    assert "No source citations" not in updated[-1]["content"]
+    _, request, options = service.streamer.calls[0]
+    assert "Private selected-only content" not in str(request)
+    assert "Document evidence (quoted JSON data):\n[]" in request[-1]["content"]
+    assert options["web_search"] == "medium" and options["system_prompt"] == WEB_SYSTEM_PROMPT
+
+
+def test_mixed_web_stream_applies_final_annotations_before_local_citation_validation(service, tmp_path):
+    _, selected = ingest(service, tmp_path)
+    raw = "Local result [1]; web result [99]."
+    annotated = "Local result [1]; web result [Research](https://example.org/research)."
+    calls = []
+    def stream(*args, **kwargs):
+        calls.append(kwargs)
+        yield raw
+        kwargs["final_text_callback"](annotated)
+    service.streamer = stream
+    updated, sources = list(service.answer("Compare results", [], "science", [selected["id"]],
+                                           model="gpt-4o", web_search="high"))[-1]
+    assert updated[-1]["content"] == annotated
+    assert "unverified" not in updated[-1]["content"]
+    assert [source["number"] for source in sources] == [1]
+    assert sources[0]["document_id"] == selected["id"]
+    assert calls[0]["web_search"] == "high"
+
+
+def test_web_link_numeric_label_is_not_treated_as_local_citation(service):
+    service.streamer = Stream("Web finding [99](https://example.org/research).")
+    updated, sources = list(service.answer("Research", [], "science", [], model="gpt-4o", web_search="low"))[-1]
+    assert sources == []
+    assert updated[-1]["content"] == "Web finding [99](https://example.org/research)."
+
+
+def test_local_citations_before_parenthetical_text_still_validate(service, tmp_path):
+    ingest(service, tmp_path)
+    service.streamer = Stream("Value [1] (measured), invalid [999] (invented).")
+    updated, _ = list(service.answer("Explain", [], "science", model="gpt-4o", web_search="low"))[-1]
+    assert "[1] (measured)" in updated[-1]["content"]
+    assert "[999]" not in updated[-1]["content"]
+
+
+@pytest.mark.parametrize("model,search", [("gpt-4", "medium"), ("gpt-4o", "invalid")])
+def test_bad_web_selection_fails_before_paid_work(service, model, search):
+    with pytest.raises(ValueError, match="web-search"):
+        list(service.answer("Question", [], "science", [], model=model, web_search=search))
+    assert not service.embedder.calls and not service.streamer.calls
+
+
+def test_web_request_budget_uses_responses_shape_and_web_context(service, tmp_path, monkeypatch):
+    image_path = service.settings.data_dir / "figure.png"
+    Image.new("RGB", (10, 10), "white").save(image_path)
+    evidence = [Evidence(Chunk("figure", "document", "Figure shows seven.", "Figure 1",
+                               image_path=str(image_path)), "figure.png", 1.0, str(image_path))]
+    calls = []
+    real_trim = tokens.trim_history
+    def trim(messages, model, **kwargs):
+        calls.append((copy.deepcopy(messages), kwargs))
+        return real_trim(messages, model, **kwargs)
+    monkeypatch.setattr(tokens, "trim_history", trim)
+    service._request("Compare with current research", [], evidence, "gpt-4o", web_search="medium")
+    assert calls and all(options["web_search"] is True for _, options in calls)
+    assert all(options["system_prompt"] == WEB_SYSTEM_PROMPT for _, options in calls)
+    assert calls[0][0][-1]["content"][0]["type"] == "input_text"
+    assert calls[0][0][-1]["content"][1]["type"] == "input_image"
+
+
+def test_web_provenance_survives_save_load_and_cannot_leak_into_document_only_context(service, tmp_path):
+    from rag_chatbot.history import load_chat, save_chat
+    _, document = ingest(service, tmp_path)
+    history = [{"role": "user", "content": "Prior question"},
+               {"role": "assistant", "content": "External web finding with SECRET_WEB_FACT [1]",
+                "web_search": True, "sources": [{"number": 1, "document_id": document["id"],
+                "filename": document["name"], "locator": "page 1", "text": "local excerpt",
+                "source_path": document["path"]}]}]
+    save_chat(history, "web history", data_dir=service.settings.data_dir)
+    restored = load_chat("web history", data_dir=service.settings.data_dir)
+    assert restored[-1]["web_search"] is True
+    list(service.answer("What did the document say?", restored, "science", model="gpt-4o"))
+    assert "SECRET_WEB_FACT" not in str(service.streamer.calls[-1][1])
+    assert restored[-1]["content"].startswith("External web finding")
+
+
+def test_invalid_saved_web_provenance_is_rejected(service):
+    from rag_chatbot.history import save_chat
+    with pytest.raises(ValueError, match="web-search provenance"):
+        save_chat([{"role": "assistant", "content": "Answer", "web_search": "false"}],
+                  "invalid", data_dir=service.settings.data_dir)
