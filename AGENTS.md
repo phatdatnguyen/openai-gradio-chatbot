@@ -28,6 +28,13 @@ python webui.py
 python -m pytest -q
 ```
 
+`pytest.ini` limits default discovery to this app's `tests/` directory, so reference
+repositories cloned alongside the app are not collected. Do not modify those clones
+to make this app's tests pass.
+`tests/conftest.py` redirects default storage to temporary directories and blocks
+unmocked shared OpenAI clients. Override it only with deterministic fake clients;
+never opt ordinary tests into paid requests or the user's data.
+
 API key is read from `OPENAI_API_KEY`, then `chatbot/api_key.py` (`API_KEY = "sk-..."`),
 with legacy root `api_key.py` support. `api_key.py` is gitignored and should never be
 committed. A missing key no longer crashes at import — the UI still launches and
@@ -69,14 +76,20 @@ on macOS/Linux to opt into the real converter check; ordinary tests mock convert
 | `chatbot/log.py` | Shared `logger`. Use this, not `print()`. |
 | `rag_chatbot/chatbot.py` | Independent RAG tab, library and citation UI. |
 | `rag_chatbot/service.py` | Indexing, cached extraction/embedding batches, retrieval and evidence assembly. |
+| `rag_chatbot/chat_context.py` | Bounded complete-source chat context; no truncation or query embedding. |
+| `rag_chatbot/source_actions.py` | Pasted-text sources and checked-original retries through the shared indexer. |
 | `rag_chatbot/ingestion.py` | Source-aware readers, opt-in vision callbacks, token chunks; no API calls. |
 | `rag_chatbot/viewer.py` | Bounded on-demand document previews, scoped to workspace sources; no API calls. |
 | `rag_chatbot/office_preview.py` | Optional local Office-to-PDF conversion and cached previews; originals stay unchanged. |
 | `rag_chatbot/store.py` | SQLite catalog/FTS5, Qdrant vectors, scoped hybrid search. |
 | `rag_chatbot/history.py` | Separate versioned RAG histories with citation snapshots. |
+| `rag_chatbot/autosave.py` | Atomic completed-reply saves, session-owned chat identities, and bounded latest-chat restore. |
 | `rag_chatbot/workspaces.py` | Safe named working directories under RAG_DATA_DIR, per-directory settings and vector namespaces. |
+| `rag_chatbot/workspace_metadata.py`, `workspace_ui.py` | Local workspace descriptions, optimistic revisions, and guarded editor controls. |
+| `rag_chatbot/research.py`, `research_ui.py` | Direct source search and local notes with origin/reference snapshots. |
 | `rag_chatbot/config.py` | RAG settings and index fingerprint. |
 | `rag_chatbot/tools/` | Selected-source snapshots, bounded Studio jobs including Compare/Evidence Check, session UI, artifacts and exports. |
+| `rag_chatbot/tools/presets.py`, `presets_ui.py` | App-wide per-tool instruction presets and explicit Apply controls. |
 | `plugins/` | Trusted bundled tool catalog, local enable/disable settings, dependency status and Plugins tab. |
 | `tests/` | Pure logic, mocked API, local storage, UI wiring, and optional conversion/RPC tests. |
 
@@ -139,11 +152,16 @@ a chat with one generated image went from 2.8 MB to under 1 KB. Loading still ac
 inline base64, so pre-existing saved chats keep working with no migration.
 
 RAG working directories live under `rag_chatbot/data/<name>/` by default (override
-the parent with `RAG_DATA_DIR`). Each has `sources/`, `chats/`, and `library.sqlite3`.
+the parent with `RAG_DATA_DIR`). Each has `sources/`, `chats/`, and `library.sqlite3`;
+descriptions use `workspace.json`, notes use `notes/<uuid>.json`, and Studio results
+use `artifacts/`. Back up the whole workspace with its vector database. App-wide
+instruction presets in `.cache/studio-presets.json` and plugin settings in
+`.cache/plugins.json` need separate inclusion in backups.
 Every RAG UI callback must receive the active working directory explicitly; never
 store a process-global active directory. Services are cached per directory, while
 conversation, reference, and active-directory state belongs to the Gradio session.
-Opening a different directory cancels pending work and resets session content. Late
+Opening a different directory cancels pending work, resets transient session content,
+and restores that directory's latest successful autosave and current Studio results. Late
 results from old jobs must not overwrite the new directory's UI. Qdrant namespaces
 and embedded database paths must also be separate for each working directory. The
 SQLite catalog is authoritative: only `ready` documents with the current fingerprint
@@ -157,6 +175,10 @@ Changing embedding/chunk settings requires reimport; never reuse incompatible ve
 The Workspace dropdown opens on user `input`, not programmatic `change`, to avoid
 reopen loops. Disable selection during the switch; stale opens must not publish
 state or finish a newer pending switch.
+If a dropdown open fails, renew editor epochs for the retained workspace and rebind
+only its already-published tool state to the final revision. Preserve drafts/study
+progress, invalidate in-flight export/reference counters, and never revive cancelled
+generation or navigation work; regression-test the failed-switch path.
 Gradio dropdown `input` also fires on unchanged blur. Dynamic document, sheet,
 history, and reference selections can arrive after their choices have changed.
 Primitive-only read callbacks bypass component preprocessing and validate against
@@ -167,12 +189,35 @@ Unchanged viewer selections must preserve the current page/sheet. Saved citation
 downloads must resolve inside the workspace's sources directory, never its catalog,
 chats, or artifacts. History lists must exclude atomic temporary files and links.
 
+RAG autosave updates only after a successful final assistant reply, preserving citation
+snapshots and `web_search`. Streaming partials, failed/cancelled requests, and stale
+workspace/answer revisions must never replace a saved conversation. New chat creates
+a new private UUID without deleting prior saves. Initial load, workspace open, and
+manual Load restore content but allocate a new session-owned continuation identity;
+the next completed reply creates its autosave. Never automatically overwrite a named
+manual snapshot or another browser session's autosave. Manual Save/Load remain usable.
+Autosaves are compatible version-1 histories with autosave metadata in `chats/`.
+Use atomic replacement, cancellation checks, a 16 MiB JSON bound, and ordinary scoped
+paths; reject links and traversal. Latest restore sorts safe candidates by file mtime
+and validates newest first, skipping invalid files without reading every full chat.
+
 RAG chat shares web-search, streaming, and sampling options with the API layer.
 Search defaults off; an empty document selection can use the web only when explicitly
 enabled. Keep web URL links separate from numbered local references. Preserve the
 web-search provenance flag in saved histories and exclude web-derived assistant
 context from later document-only answers. Model/effort capability predicates govern
 sampling controls, and nonstreaming requests use the blocking shared sender.
+
+Chat Document context defaults to `relevant`. Explicit `full` uses every ordered
+indexed passage from checked sources, without Qdrant or a query embedding. Enforce
+40 documents, 512 chunks, 500,000 source characters, 32,000 serialized evidence
+tokens, and model-specific context preflight before generation. Never drop evidence
+or silently fall back to retrieval; only older conversation turns may be trimmed.
+Full mode includes indexed OCR/descriptions, not all original page images. Validate
+snapshot generations and cancellation before/after generation and during streaming.
+Keep `context_mode="full"` in saved assistant messages. Empty full selections fail
+even when web search is enabled. Chat Send/Save/Load/New/Stop callbacks receive a
+client workspace epoch so queued old inputs cannot operate on newly resolved State.
 
 Document preview selection is separate from the retrieval filter. Load previews only
 on demand, reset them when the working directory changes, and discard late results.
@@ -189,6 +234,48 @@ Keep selections keyed by document ID, preserve unchecked sources across refresh/
 and reject stale updates after a workspace switch. Editable upload filenames are validated
 library metadata; never rename the user's upload or move stable managed originals.
 
+Pasted text uses the normal ingestion pipeline as a TXT/MD managed original. Validate
+portable filenames and a 1 MiB UTF-8 text bound before storage or paid work; clean
+only the action's temporary staging file/directory. Retry indexing uses checked IDs
+and retained originals, never all sources implicitly. Check collection membership,
+content hashes, and unresolved catalog paths via `LibraryStore.original_path` so
+in-workspace symlinks/junctions cannot be hidden by path resolution. Keep compatible
+extraction/embedding caches. Per-call cancellation must reach vision, embedding, and
+vector publication gates; a cancelled upload cannot publish a ready catalog row.
+
+### Research and workspace metadata
+
+Workspace descriptions are local metadata, at most 2,000 characters; they are not
+model instructions. Save `workspace.json` atomically with bounded JSON and optimistic
+revision checks, preserving the current editor on conflict. Notes live separately
+from chats and tool artifacts. Keep origin (`human`, `ai`, or `excerpt`), timestamps,
+revision, `user_edited`, source snapshots, and web-search provenance. Editing a note
+retains its origin and references; do not imply retained citations support new text.
+Capture only completed chat answers or the selected current search result. Note
+CRUD and title/body filtering are local and make no API calls. Notes are never
+automatically indexed or added to chat/Studio evidence. Validate UUIDs, bounds,
+revisions, and workspace paths, and scope reference downloads to `sources/`.
+Saved notes export Markdown/JSON under `notes/exports/`, with full provenance and
+reference snapshots and workspace-relative paths. Reject unsaved editor differences,
+revision conflicts, stale workspace/editor/export epochs, and filename/format changes.
+Check cancellation before serialization and atomic replacement, preserving an old
+download on failure. Downloads do not modify notes or index them as evidence.
+
+Research Search defaults to local SQLite keyword search and must not connect to
+Qdrant or call a model in that mode. Explicit Hybrid checks Qdrant before requesting
+one query embedding through the shared API path; neither mode generates an answer.
+Require a nonempty checked-source selection, honor collection/fingerprint/published
+generation, and validate source snapshots and cancellation before and after work.
+
+Guard queued description, note, search, and preset callbacks with hidden browser
+epoch values as well as server-side workspace revisions/editor tokens. Gradio reads
+State when queued work executes, while primitive inputs were captured when clicked;
+an old typed value can otherwise be paired with a new workspace or editor State.
+Check the captured epoch before reads/writes and recheck cancellation before atomic
+replacement. Rotate epochs on workspace/editor reset; stale selections and unchanged
+dropdown blur must not erase unsaved edits. Keep process_api regressions that pass
+old client epochs with newly updated server States.
+
 ### Studio tools
 
 Summary, Spreadsheet, Presentation, Graphics, Plot, Mind Map, Flashcards, Quizzes,
@@ -199,6 +286,16 @@ All paid text generation goes through `chatbot.api.generate_structured()` and th
 `chatbot.api.generate_image_asset()`, also used by the original Chat image wrapper.
 Treat refusals, malformed JSON, and
 incomplete replies as failures; never quietly retry using a weaker output format.
+
+Each tool has app-wide instruction presets in `.cache/studio-presets.json`, scoped
+by trusted tool ID. Selecting a preset only selects it; explicit Apply replaces that
+tool's instruction text without generating or changing sources, model/count/export
+settings, chat, or saved output. Save creates or updates a selected preset; New
+clears the selection, and Delete preserves current instructions. Validate names,
+instruction bounds, IDs, and optimistic revisions, and apply only the requested
+record mutation so another session's unrelated presets survive. All persistence is
+local, atomic, link-safe, and cancellation-guarded. Workspace resets reload preset
+choices and rotate editor epochs without applying instructions automatically.
 
 Whole-document tools use ordered catalog snapshots of all selected ready chunks,
 including content hashes, fingerprints and published generations. Do not implement

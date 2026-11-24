@@ -139,6 +139,7 @@ def _interact(tool_id, action, selection, envelope, workspace, operation_state):
     with ui._JOB_LOCK:
         if not _matches(envelope, workspace, operation_state, tool_id):
             return skip
+        revision = operation_state.get("revision", 0)
         state = deepcopy(operation_state["learning"][tool_id])
     items = envelope["payload"]["content"]["cards" if tool_id == "flashcards" else "questions"]
     if action in {"next", "previous"}:
@@ -158,7 +159,8 @@ def _interact(tool_id, action, selection, envelope, workspace, operation_state):
     state["view_revision"] += 1
     result = _view(envelope, state, gr.skip())
     with ui._JOB_LOCK:
-        if not _matches(envelope, workspace, operation_state, tool_id):
+        if (not ui._current(operation_state, revision)
+                or not _matches(envelope, workspace, operation_state, tool_id)):
             return skip
         operation_state["learning"][tool_id] = state
     return result
@@ -199,11 +201,13 @@ def on_export(tool_id, envelope, filename, output_format, workspace, operation_s
 
 
 def on_reference(selection, envelope, workspace, operation_state):
+    revision = operation_state.get("revision", 0)
     tool_id = envelope.get("payload", {}).get("tool_id") if envelope else None
     if tool_id not in DEFAULT_INSTRUCTIONS or not _matches(envelope, workspace, operation_state, tool_id, view=False):
         return gr.skip(), gr.skip()
     result = _ui().on_reference(selection, envelope, workspace, operation_state)
-    return result if _matches(envelope, workspace, operation_state, tool_id, view=False) else (gr.skip(), gr.skip())
+    return (result if _ui()._current(operation_state, revision)
+            and _matches(envelope, workspace, operation_state, tool_id, view=False) else (gr.skip(), gr.skip()))
 
 
 def build(tool_id, workspace, selected_ids, collection, model, reasoning_effort, operation_state):

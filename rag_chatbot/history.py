@@ -51,6 +51,10 @@ def _validate(history):
             if type(message["web_search"]) is not bool:
                 raise ValueError("Invalid web-search provenance in RAG history.")
             item["web_search"] = message["web_search"]
+        if "context_mode" in message:
+            if message["context_mode"] not in ("relevant", "full"):
+                raise ValueError("Invalid document-context provenance in RAG history.")
+            item["context_mode"] = message["context_mode"]
         if "sources" in message:
             sources = message["sources"]
             if not isinstance(sources, list):

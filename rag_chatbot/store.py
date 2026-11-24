@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
 import unicodedata
@@ -207,6 +208,37 @@ class LibraryStore:
             row = self._db.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
             return self._document(row)
 
+    def original_path(self, document_id):
+        """Return a live source original after checking its unresolved catalog path.
+
+        Document views resolve paths for compatibility. Validate the stored
+        components here so an in-workspace symlink is not hidden by resolve().
+        """
+        with self._lock:
+            row = self._db.execute("SELECT path,status FROM documents WHERE id=?", (document_id,)).fetchone()
+            if row is None or row["status"] == "deleted":
+                raise ValueError("The source no longer belongs to this library.")
+            path = Path(row["path"])
+            if not path.is_absolute():
+                path = self.data_dir / path
+            try:
+                parts = path.relative_to(self.data_dir).parts
+            except ValueError as exc:
+                raise ValueError("Source originals must stay inside this library's sources directory.") from exc
+            if not parts or parts[0] != "sources" or ".." in parts:
+                raise ValueError("Source originals must stay inside this library's sources directory.")
+            current = self.data_dir
+            for part in parts:
+                current = current / part
+                if current.exists() or current.is_symlink():
+                    attributes = getattr(current.lstat(), "st_file_attributes", 0)
+                    if (current.is_symlink()
+                            or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                        raise ValueError("Source originals cannot use linked files or directories.")
+            if not current.is_file() or not current.resolve().is_relative_to(self.data_dir / "sources"):
+                raise ValueError("The source original is missing. Upload the document again.")
+            return current
+
     def list_documents(self, collection=None):
         with self._lock:
             sql = "SELECT * FROM documents WHERE status != 'deleted'"
@@ -292,14 +324,24 @@ class LibraryStore:
             raise ValueError("An embedding cannot be an all-zero vector.")
         return values
 
-    def commit_document(self, document_id, chunks, vectors):
+    def commit_document(self, document_id, chunks, vectors, *, is_cancelled=None):
         from qdrant_client import models
+
+        if is_cancelled is not None and not callable(is_cancelled):
+            raise ValueError("The indexing cancellation check must be callable.")
+
+        def check_current():
+            if is_cancelled is not None and is_cancelled():
+                raise RuntimeError("Indexing stopped before catalog publication.")
+
         chunks, vectors = list(chunks), list(vectors)
         with self._lock:
             document = self.get_document(document_id)
             if document is None or document["status"] != "staging":
                 raise ValueError("Only a staged document can be published.")
+            name = generation = None
             try:
+                check_current()
                 if not chunks or len(chunks) != len(vectors):
                     raise ValueError("Document chunks and embeddings must be non-empty and have matching lengths.")
                 if len({chunk.id for chunk in chunks}) != len(chunks):
@@ -314,8 +356,10 @@ class LibraryStore:
                         raise ValueError("A chunk identifier already belongs to another document.")
                 vectors = [self._vector(vector, document["dimensions"]) for vector in vectors]
                 name = self.ensure_index(document["fingerprint"], document["dimensions"])
+                check_current()
                 generation = str(uuid.uuid4())
                 for offset in range(0, len(chunks), 128):
+                    check_current()
                     points = [models.PointStruct(
                         id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"rag:{document_id}:{chunk.id}:{generation}")),
                         vector=vector, payload={"chunk_id": chunk.id, "document_id": document_id,
@@ -323,8 +367,10 @@ class LibraryStore:
                                                 "generation": generation},
                     ) for chunk, vector in zip(chunks[offset:offset + 128], vectors[offset:offset + 128])]
                     self.vector_client.upsert(name, points=points, wait=True)
+                    check_current()
                 with self._db:
                     self._db.execute("BEGIN IMMEDIATE")
+                    check_current()
                     status = self._db.execute("SELECT status FROM documents WHERE id=?", (document_id,)).fetchone()
                     if status is None or status[0] != "staging":
                         raise ValueError("The document was deleted or published during indexing.")
@@ -335,13 +381,27 @@ class LibraryStore:
                           str(self._managed_path(chunk.image_path)) if chunk.image_path else None, ordinal)
                          for ordinal, chunk in enumerate(chunks)],
                     )
+                    check_current()
                     self._db.execute(
                         "UPDATE documents SET status='ready',error='',chunk_count=?,generation=?,"
                         "updated_at=CURRENT_TIMESTAMP WHERE id=?", (len(chunks), generation, document_id))
+                    check_current()
             except Exception as exc:
                 # Publishing spans two stores. Any error leaves catalog visibility
                 # off, including errors after Qdrant accepted some or all vectors.
                 self.fail_document(document_id, str(exc))
+                if name is not None and generation is not None:
+                    try:
+                        self.vector_client.delete(name, points_selector=models.FilterSelector(
+                            filter=models.Filter(must=[
+                                models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
+                                models.FieldCondition(key="generation", match=models.MatchValue(value=generation)),
+                            ])), wait=True)
+                    except Exception as cleanup_error:
+                        # Only this unpublished generation is eligible for
+                        # cleanup. Failed catalog status remains authoritative.
+                        logger.warning("Unpublished vectors for %s could not be removed: %s",
+                                       document_id, cleanup_error)
                 raise
             return self.get_document(document_id)
 

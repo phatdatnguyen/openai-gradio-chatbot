@@ -74,6 +74,43 @@ def _current(operation_state, revision, answer_revision=None):
                  or operation_state.get("answer_revision", 0) == answer_revision))
 
 
+def rebind_retained_workspace(workspace, operation_state, previous_revision, final_revision):
+    """Keep published results usable after a failed open retains their workspace.
+
+    The caller supplies the revision captured before switching and the revision
+    its final commit will publish. No outputs, drafts, study progress, or jobs
+    are reset. In-flight requests must remain invalid after rebinding.
+    """
+    with _JOB_LOCK:
+        if (not isinstance(workspace, str) or not workspace
+                or type(previous_revision) is not int or type(final_revision) is not int
+                or final_revision <= previous_revision
+                or not operation_state.get("switching", False)
+                or operation_state.get("workspace_open_pending", False)
+                or operation_state.get("revision", 0) != final_revision - 1):
+            return 0
+        published = [(tool_id, operation_state.get(tool_id)) for tool_id in
+                     ("presentation", "graphics", "plot", "compare", "evidence_check")]
+        learning = operation_state.get("learning", {})
+        if isinstance(learning, dict):
+            published.extend((tool_id, learning.get(tool_id)) for tool_id in ("flashcards", "quizzes"))
+        rebound = 0
+        for tool_id, state in published:
+            if (not isinstance(state, dict) or state.get("workspace") != workspace
+                    or type(state.get("workspace_revision")) is not int
+                    or state["workspace_revision"] != previous_revision
+                    or not isinstance(state.get("token"), str) or not state["token"]):
+                continue
+            state["workspace_revision"] = final_revision
+            # Exports/references may dynamically consult this published state;
+            # renewing their counters prevents old requests becoming current.
+            for suffix in ("export_revision", "reference_revision"):
+                key = f"{tool_id}_{suffix}"
+                operation_state[key] = operation_state.get(key, 0) + 1
+            rebound += 1
+        return rebound
+
+
 def _status(message, tool_id="spreadsheet"):
     return gr.skip(), message, *((gr.skip(),) * (OUTPUT_COUNTS[tool_id] - 2))
 
@@ -942,6 +979,8 @@ def build_tools(workspace, selected_ids, collection, model, reasoning_effort, op
                 "Use instructions to set the language and focus. Save outputs separately from chats.")
     controls = {}
     all_outputs = []
+    preset_outputs = []
+    from . import presets_ui
     from .presentation_ui import build as build_presentation
     from .graphics_ui import build as build_graphics
     from .plot_ui import build as build_plot
@@ -957,6 +996,11 @@ def build_tools(workspace, selected_ids, collection, model, reasoning_effort, op
                 tool = builders[tool_id](workspace, selected_ids, collection, model, reasoning_effort, operation_state)
                 controls[tool_id] = tool
                 all_outputs.extend(tool.outputs)
+                tool.presets = presets_ui.build(tool_id, tool.instructions, workspace, operation_state)
+                preset_outputs.extend(tool.presets.outputs)
+            tool.presets.refresh_event = tab.select(tool.presets.refresh_callback,
+                tool.presets.inputs, tool.presets.outputs, trigger_mode="always_last",
+                concurrency_id="studio-instruction-presets", concurrency_limit=1, show_progress="hidden")
             if tool_id in {"graphics", "plot"}:
                 tool.tab = tab
                 tool.restore_event = tab.select(partial(on_visual_tool_open, tool_id),
@@ -966,4 +1010,5 @@ def build_tools(workspace, selected_ids, collection, model, reasoning_effort, op
             with gr.Tab(label):
                 gr.Markdown(f"**{label}** is planned for a later stage. " + ", ".join(TOOL_LABELS.values()) + " are available now.")
     return SimpleNamespace(controls=controls, outputs=all_outputs,
-                           statuses=[tool.status for tool in controls.values()])
+                           statuses=[tool.status for tool in controls.values()],
+                           preset_outputs=preset_outputs, preset_reset_callback=presets_ui.reset_all)

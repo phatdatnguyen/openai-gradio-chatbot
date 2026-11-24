@@ -31,6 +31,27 @@ that require web search are excluded from structured tool generation.
 - **Quizzes** creates multiple-choice questions with four options, one correct answer,
   and a cited explanation. Checking answers and calculating scores run locally.
 
+## Reusable instruction presets
+
+Each tool has an **Instruction presets** accordion. Write the instructions you want
+to reuse, click **New preset**, enter a **Preset name**, and click **Save preset**.
+Presets are specific to a tool and available in every workspace in this app.
+
+Choose a **Saved instruction preset**, then click **Apply preset** to replace the
+tool's instruction text. Selecting a preset alone leaves the instructions unchanged;
+applying it does not start generation. Presets store only instructions, so choose
+sources, model settings, counts, and export options separately.
+
+With a preset selected, **Save preset** updates it from the current name and tool
+instructions. **New preset** clears the selection so the next save creates another
+preset. **Delete preset** removes it without changing current instructions or saved
+tool results. Use **Refresh presets** to see changes from another browser session;
+conflicting edits require refreshing and selecting the preset again.
+
+These actions run locally and make no model requests. The app-wide file is
+`.cache/studio-presets.json`; include it in backups alongside workspace data.
+Research notes and workspace descriptions do not automatically enter tool prompts.
+
 ## Summary
 
 Tools show progress and source coverage. Summary starts with the instruction

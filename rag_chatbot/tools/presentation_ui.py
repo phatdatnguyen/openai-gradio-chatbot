@@ -86,6 +86,7 @@ def on_navigate(action, selection, envelope, workspace, operation_state):
     with ui._JOB_LOCK:
         if not _matches(envelope, workspace, operation_state):
             return skip
+        revision = operation_state.get("revision", 0)
         state = deepcopy(operation_state["presentation"])
     slides = envelope["payload"]["content"]["slides"]
     if action in {"previous", "next"}:
@@ -99,7 +100,8 @@ def on_navigate(action, selection, envelope, workspace, operation_state):
     state["view_revision"] += 1
     result = _view(envelope, state, gr.skip())
     with ui._JOB_LOCK:
-        if not _matches(envelope, workspace, operation_state):
+        if (not ui._current(operation_state, revision)
+                or not _matches(envelope, workspace, operation_state)):
             return skip
         operation_state["presentation"] = state
     return result

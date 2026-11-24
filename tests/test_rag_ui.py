@@ -55,21 +55,60 @@ def test_root_tabs_build_without_initializing_rag(ui, monkeypatch):
     app = host.create_app()
     tabs = [component["props"]["label"] for component in app.config["components"]
             if component["type"] == "tabitem"]
-    assert tabs == ["Chat", "RAG Chat", "Summary", "Spreadsheet", "Presentation", "Graphics", "Plot", "Mind Map", "Flashcards",
+    assert tabs == ["Chat", "RAG Chat", "Search", "Notes", "Summary", "Spreadsheet", "Presentation", "Graphics", "Plot", "Mind Map", "Flashcards",
                     "Quizzes", "Compare", "Evidence Check", "Plugins"]
     assert app.chat_tab.state is not app.rag_tab.history_state
     assert app.rag_tab.history_state is not app.rag_tab.sources_state
     assert app.chat_tab.send_event["id"] != app.rag_tab.send_event["id"]
     dependencies = app.config["dependencies"]
     for button, event in [(app.chat_tab.stop_button, app.chat_tab.send_event),
-                          (app.rag_tab.stop_button, app.rag_tab.send_event),
-                          (app.rag_tab.index_stop_button, app.rag_tab.index_event)]:
+                          (app.rag_tab.stop_button, app.rag_tab.send_event)]:
         cancellations = [item["cancels"] for item in dependencies
                          if (button._id, "click") in map(tuple, item["targets"]) and item["cancels"]]
         assert cancellations == [[event["id"]]]
+    index_cancels = next(item["cancels"] for item in dependencies
+                         if (app.rag_tab.index_stop_button._id, "click") in map(tuple, item["targets"])
+                         and item["cancels"])
+    assert index_cancels == [app.rag_tab.index_event["id"],
+                            *(event["id"] for event in app.rag_tab.source_actions.index_events)]
     index_stop = next(item for item in dependencies
                       if app.fns[item["id"]].fn is ui.on_stop_index)
     assert index_stop["queue"] is False
+
+
+def test_workspace_extras_abort_before_resetting_a_newer_workspace(ui, monkeypatch):
+    from rag_chatbot import research_ui, workspace_ui
+    from rag_chatbot.tools import presets_ui
+
+    operation = {"revision": 3}
+
+    def delayed_research(workspace, state):
+        state["revision"] = 4
+        return ("old research",) * research_ui.OUTPUT_COUNT
+
+    def unexpected(*args):
+        pytest.fail("An old reset must not change the newer workspace's editor tokens")
+
+    monkeypatch.setattr(research_ui, "on_reset", delayed_research)
+    monkeypatch.setattr(workspace_ui, "on_reset", unexpected)
+    monkeypatch.setattr(presets_ui, "reset_all", unexpected)
+    assert ui.on_workspace_extras("Alpha", operation) == (ui.gr.skip(),) * ui.workspace_extra_count()
+
+
+def test_workspace_extras_discard_all_outputs_if_last_reset_is_superseded(ui, monkeypatch):
+    from rag_chatbot import research_ui, workspace_ui
+    from rag_chatbot.tools import presets_ui
+
+    operation = {"revision": 3}
+    monkeypatch.setattr(research_ui, "on_reset", lambda *args: ("research",) * research_ui.OUTPUT_COUNT)
+    monkeypatch.setattr(workspace_ui, "on_reset", lambda *args: ("description",) * workspace_ui.OUTPUT_COUNT)
+
+    def delayed_presets(workspace, state):
+        state["revision"] += 1
+        return ("presets",) * presets_ui.RESET_OUTPUT_COUNT
+
+    monkeypatch.setattr(presets_ui, "reset_all", delayed_presets)
+    assert ui.on_workspace_extras("Alpha", operation) == (ui.gr.skip(),) * ui.workspace_extra_count()
 
 
 def test_library_refresh_preserves_valid_scope_and_shows_failed_documents(ui, service):
@@ -318,6 +357,7 @@ def test_workspace_layout_and_event_scope(ui, monkeypatch):
     assert review_cancels == [[event["id"] for event in controls.viewer_events[1:]]]
     cancellation = next(event for event in dependencies if event["cancels"] == [
         controls.send_event["id"], controls.index_event["id"],
+        *(event["id"] for event in controls.source_actions.index_events),
         *(event["id"] for event in controls.viewer_events)])
     assert cancellation["targets"] == [(controls.workspace_button._id, "click")]
     assert controls.workspace_selection_event["targets"] == [(controls.workspace_name._id, "input")]
@@ -325,7 +365,10 @@ def test_workspace_layout_and_event_scope(ui, monkeypatch):
     assert not controls.workspace_selection_event["cancels"]
     assert controls.workspace_open_event["trigger_after"] == controls.workspace_cancel_event["id"]
     assert controls.workspace_tools_event["trigger_after"] == controls.workspace_open_event["id"]
-    assert controls.workspace_ready_event["trigger_after"] == controls.workspace_tools_event["id"]
+    assert controls.workspace_research_event["trigger_after"] == controls.workspace_tools_event["id"]
+    assert controls.workspace_ready_event["trigger_after"] == controls.workspace_research_event["id"]
+    assert controls.research_load_event["trigger_after"] == controls.tools_load_event["id"]
+    assert len(controls.workspace_extra_outputs) == ui.workspace_extra_count()
     functions = {fn.fn: fn for fn in app.fns.values() if fn.fn is not None}
     for callback in (ui.on_answer, ui.on_index_uploads, ui.on_refresh, ui.on_select_source,
                      ui.on_save_chat, ui.on_load_chat, ui.on_delete_documents, ui.on_stop_index,
@@ -346,8 +389,10 @@ def test_workspace_layout_and_event_scope(ui, monkeypatch):
     assert functions[ui.on_upload_files_change].preprocess is True
     assert controls.upload_selector not in functions[ui.on_upload_files_change].inputs
     assert controls.upload_names_state in functions[ui.on_open_workspace].outputs
-    for component in (controls.web_search, controls.stream_output, controls.temperature, controls.top_p):
+    for component in (controls.web_search, controls.stream_output, controls.temperature, controls.top_p,
+                      controls.context_mode, controls.chat_workspace_epoch):
         assert component in functions[ui.on_answer].inputs
+    assert controls.context_mode.value == "relevant"
     assert controls.web_search.value == ui.model_config.WEB_SEARCH_OFF
     assert controls.stream_output.value is True
     assert controls.source_text.lines == controls.source_text.max_lines == 6
@@ -375,10 +420,12 @@ def test_workspace_open_clears_state_and_errors_keep_active(ui, monkeypatch, tmp
         list_chats=lambda *, data_dir: [data_dir.name + " chat"]))
     revision = {"revision": 1, "switching": True}
     result = ui.on_open_workspace("Beta", "Alpha", operation_state=revision)
-    assert revision == {"revision": 2, "switching": True, "viewer_revision": 1, "review_document_id": None,
+    assert revision["autosave"]["workspace"] == "Beta"
+    assert {key: value for key, value in revision.items() if key != "autosave"} == {"revision": 2, "switching": True, "viewer_revision": 1, "review_document_id": None,
                         "review_document_ids": [], "viewer_sheets": [], "selected_ids": [], "known_ready_ids": []}
     ready, button, dropdown = ui.on_finish_workspace_switch(revision)
-    assert ready is revision and revision == {"revision": 3, "switching": False, "viewer_revision": 1,
+    assert ready is revision
+    assert {key: value for key, value in revision.items() if key != "autosave"} == {"revision": 3, "switching": False, "viewer_revision": 1,
                                               "review_document_id": None, "review_document_ids": [], "viewer_sheets": [],
                                               "selected_ids": [], "known_ready_ids": []}
     assert button["interactive"] is True
@@ -449,6 +496,8 @@ def test_automatic_workspace_open_commits_before_enabling_and_preserves_tools_on
     operation = {"revision": 0, "switching": False}
     monkeypatch.setattr(ui, "get_service", lambda workspace: SimpleNamespace(cancel_ingestion=lambda: None))
     resets = []
+    extra_resets = []
+    retained = []
 
     def open_workspace(name, current_workspace, current_history, pending, operation_state):
         assert operation_state["switching"]
@@ -465,8 +514,15 @@ def test_automatic_workspace_open_commits_before_enabling_and_preserves_tools_on
         resets.append(workspace)
         return (ui.gr.skip(),) * tools_ui.TOTAL_OUTPUT_COUNT
 
+    def reset_extras(workspace, operation_state):
+        assert operation_state["switching"]
+        extra_resets.append((workspace, operation_state["revision"] + 1))
+        return (ui.gr.skip(),) * ui.workspace_extra_count()
+
     monkeypatch.setattr(ui, "on_open_workspace", open_workspace)
     monkeypatch.setattr(tools_ui, "on_workspace_reset", reset)
+    monkeypatch.setattr(ui, "on_workspace_extras", reset_extras)
+    monkeypatch.setattr(tools_ui, "rebind_retained_workspace", lambda *args: retained.append(args))
     stream = ui.on_workspace_selection("Beta", "Alpha", [], None, operation)
     preparing = next(stream)
     assert preparing[1]["interactive"] is False and operation["switching"]
@@ -474,6 +530,8 @@ def test_automatic_workspace_open_commits_before_enabling_and_preserves_tools_on
     assert committed[0] == ("Beta" if success else ui.gr.skip())
     assert operation["switching"] is True  # Server still has to apply this yield's active State.
     assert resets == (["Beta"] if success else [])
+    assert extra_resets == [("Beta" if success else "Alpha", 3)]
+    assert retained == ([] if success else [("Alpha", operation, 0, 3)])
     ready = next(stream)
     assert ready[1]["interactive"] is True and operation["switching"] is False
     assert ready[0] == ui.gr.skip()

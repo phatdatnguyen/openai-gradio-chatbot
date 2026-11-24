@@ -89,13 +89,21 @@ For a small library without Docker, follow the [embedded database setup](docs/ra
 
 1. Select a **Workspace** to open it, or type a new name and press Enter.
 2. Upload files under **Sources**, adjust their display filenames if needed, and
-   click **Index documents**. Enable vision extraction for scanned pages or images.
+   click **Index documents**, or use **Add pasted text**. Enable vision extraction
+   for scanned pages or images; **Retry checked sources** reuses retained originals.
 3. Check the sources you want to use, then ask a question. The same selection is
-   used by Studio tools. Web search is optional and starts off.
+   used by Studio tools. **Document context** chooses relevant passages or all
+   indexed text in the checked sources. Web search starts off.
 4. Open an answer's **References** to inspect its supporting passage. Select a
    source in **Document viewer** to preview it immediately.
-5. Save conversations before switching workspaces. Each Studio tool automatically
-   keeps its latest successful result and restores it when you return.
+5. Completed replies save automatically; reopening a workspace restores its latest
+   autosaved conversation. Use **Save RAG chat** for a named snapshot. Studio tools
+   also restore their latest successful results.
+
+Under **Research — Search and Notes**, search checked sources directly or keep
+notes from your own writing, chat answers, and source excerpts. **Keyword (local)**
+search makes no API request; **Hybrid** uses a query embedding without generating
+an answer. Notes stay separate from chat evidence and export to Markdown or JSON.
 
 Supported sources include PDF, DOCX, XLS/XLSX, PPTX, CSV/TSV, HTML, Markdown, text,
 and images. Convert legacy DOC/PPT files before indexing. Office is not required
@@ -126,6 +134,8 @@ previews, storage, and troubleshooting.
 Open a tool under RAG Chat's **Tools**, adjust its instructions, and generate.
 Tools share the checked sources and Prompt model/reasoning settings. Use the
 **Plugins** tab's Enabled checkboxes to manage availability.
+Each tool's **Instruction presets** lets you save reusable instructions across
+workspaces; select a preset and click **Apply preset** before generating.
 
 For an Iris scatter plot, select only the CSV and ask for sepal length on the
 x-axis, sepal width on the y-axis, colored by species. CSV/TSV plots read all rows
@@ -140,5 +150,4 @@ limits, and examples. Audio and video tools are outside the current scope.
 - [RAG Chat guide](docs/rag-guide.md)
 - [Studio tools guide](docs/studio-tools.md)
 - [Development, tests, and backups](docs/development.md)
-
-
+- [Open Notebook comparison and adopted features](docs/open-notebook-review.md)

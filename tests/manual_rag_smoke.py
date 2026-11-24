@@ -6,6 +6,7 @@ localhost server and uses in-memory Qdrant with deterministic model substitutes.
 """
 
 import json
+from functools import partial
 import os
 from pathlib import Path
 import sys
@@ -25,7 +26,10 @@ def main():
         from gradio_client import Client, handle_file
         from qdrant_client import QdrantClient
         from chatbot import config, history_store
-        from rag_chatbot import chatbot as ui, workspaces
+        from rag_chatbot import chatbot as ui, workspaces, research, research_ui, workspace_ui
+        from rag_chatbot import service as service_module
+        from rag_chatbot import source_actions
+        from rag_chatbot.tools import presets, presets_ui
         from rag_chatbot.config import Settings
         from rag_chatbot.service import RAGService
         from rag_chatbot.store import LibraryStore
@@ -35,6 +39,7 @@ def main():
 
         config.get_client = prohibit_paid_client
         history_store.HISTORY_DIR = str(root / "original-chat-history")
+        presets.SETTINGS_PATH = root / "studio-presets.json"
         calls = {"embeddings": 0, "answers": 0}
 
         def embed(texts):
@@ -67,6 +72,7 @@ def main():
             return services[workspace]
 
         ui.get_service = get_service
+        service_module.get_service = get_service
 
         import webui
         app = webui.demo
@@ -78,10 +84,19 @@ def main():
                                quiet=True, inbrowser=False, share=False, show_error=True, css=webui.APP_CSS)
             client = Client(app.local_url, verbose=False, download_files=root / "downloads")
 
-            def call(function, *args):
-                job = client.submit(*args, api_name="/" + names[function])
+            client_values = {}
+
+            def call(function, *args, tool_id=None):
+                block = next(item for item in app.fns.values() if (
+                    isinstance(item.fn, partial) and item.fn.func is function and item.fn.args[0] == tool_id
+                    if tool_id is not None else item.fn is function
+                    or isinstance(item.fn, partial) and item.fn.func is function))
+                submitted = list(args)
+                inputs = [component for component in block.inputs if not component.skip_api]
+                for component in inputs[len(submitted):]:
+                    submitted.append(client_values.get(component._id, component.value))
+                job = client.submit(*submitted, api_name="/" + block.api_name)
                 job.result()
-                block = next(item for item in app.fns.values() if item.fn is function)
                 outputs = [component for component in block.outputs if not component.skip_api]
                 merged = {}
                 for result in job.outputs():
@@ -96,10 +111,19 @@ def main():
                                 merged[component._id] = value
                         else:
                             merged[component._id] = value
+                for component_id, value in merged.items():
+                    if isinstance(value, dict) and value.get("__type__") == "update":
+                        if "value" in value:
+                            client_values[component_id] = value["value"]
+                        elif isinstance(value.get("props"), dict) and "value" in value["props"]:
+                            client_values[component_id] = value["props"]["value"]
+                    else:
+                        client_values[component_id] = value
                 return merged
 
             controls = app.rag_tab
             call(ui.on_initial_load)
+            call(ui.on_workspace_extras)
             saved_sources = {}
             for workspace, date in [("Alpha", "June 1"), ("Beta", "July 2")]:
                 preparing = call(ui.on_prepare_workspace_switch)
@@ -110,6 +134,7 @@ def main():
                                "Default", [], "gpt-4o", "auto")
                 assert "Wait for the workspace" in blocked[controls.status._id]
                 assert calls == calls_before_ready
+                call(ui.on_workspace_extras)
                 call(ui.on_finish_workspace_switch)
                 assert opened[controls.workspace_name._id]["value"] == workspace
                 assert opened[controls.chatbot._id] == []
@@ -123,6 +148,8 @@ def main():
                 assert opened[controls.viewer_original._id] is None
                 assert opened[controls.upload_filename._id]["value"] == ""
                 assert opened[controls.upload_editor_path._id] == ""
+                described = call(workspace_ui.on_save, f"Research project {workspace}")
+                assert "saved" in described[controls.workspace_details.status._id]
 
                 document = root / f"{workspace}-launch-notes.txt"
                 document.write_text(f"Project {workspace} launches on {date}. The owner is Morgan.\n",
@@ -179,10 +206,60 @@ def main():
                 original = Path(preview[controls.original_file._id])
                 assert original.is_file() and date in original.read_text(encoding="utf-8")
 
+                # Autosave and research interactions use the real HTTP/RPC
+                # session, while all generation/embedding remains substituted.
+                assert "autosaved" in answered[controls.status._id]
+                assert len(list(services[workspace].settings.data_dir.glob("chats/Autosaved *.json"))) == 1
+                before_full = calls["embeddings"]
+                full_answer = call(ui.on_answer, f"Read all indexed text about Project {workspace}",
+                    "Default", [document_id], "gpt-4o", "auto", config.WEB_SEARCH_OFF, True, 1.0, 1.0, "full")
+                assert f"{date} [1]" in str(full_answer[controls.chatbot._id])
+                assert calls["embeddings"] == before_full
+                research_controls = controls.research
+                before_research = dict(calls)
+                searched = call(research_ui.on_search, "launches", "keyword", "Default", [document_id])
+                assert date in str(searched[research_controls.results._id]), searched
+                passage = call(research_ui.on_search_reference, "0")
+                assert date in passage[research_controls.search_excerpt._id]
+                excerpt_note = call(research_ui.on_capture_excerpt, "0")
+                assert "Source excerpt" in excerpt_note[research_controls.provenance._id]
+                captured = call(research_ui.on_capture_answer)
+                assert "AI-derived" in captured[research_controls.provenance._id]
+                edited = call(research_ui.on_save, f"{workspace} findings", f"Reviewed: {date}")
+                assert "Edited by the user" in edited[research_controls.provenance._id]
+                assert len(research.list_notes(workspace)) == 2
+                filtered = call(research_ui.on_filter, "Reviewed")
+                assert len(filtered[research_controls.note_selector._id]["choices"]) == 1
+                assert calls == before_research
+                for export_format in ("md", "json"):
+                    call(research_ui.on_note_export_options, f"{workspace} findings", f"Reviewed: {date}",
+                         "Research note", export_format)
+                    exported = call(research_ui.on_note_export, f"{workspace} findings", f"Reviewed: {date}",
+                                    "Research note", export_format)
+                    exported_path = Path(exported[research_controls.note_download._id])
+                    assert exported_path.suffix == "." + export_format
+                    assert date in exported_path.read_text(encoding="utf-8")
+                    assert calls == before_research
+
+                summary = controls.tools.controls["summary"]
+                if workspace == "Alpha":
+                    preset_saved = call(presets_ui.on_save, "Methods", "Summarize the methods and limitations.",
+                                        tool_id="summary")
+                    assert "saved" in preset_saved[summary.presets.status._id]
+                else:
+                    refreshed_presets = call(presets_ui.on_refresh, tool_id="summary")
+                    choices = refreshed_presets[summary.presets.selector._id]["choices"]
+                    assert choices[0][0] == "Methods"
+                    call(presets_ui.on_select, choices[0][1], tool_id="summary")
+                applied = call(presets_ui.on_apply, tool_id="summary")
+                assert applied[summary.instructions._id] == "Summarize the methods and limitations."
+                assert calls == before_research
+
                 saved = call(ui.on_save_chat, "RPC smoke chat")
                 assert "Saved RPC smoke chat" in saved[controls.save_status._id]
                 saved_file = services[workspace].settings.data_dir / "chats" / "RPC smoke chat.json"
                 payload = json.loads(saved_file.read_text(encoding="utf-8"))
+                assert payload["messages"][-1]["context_mode"] == "full"
                 saved_sources[workspace] = payload["messages"][-1]["sources"]
                 assert saved_sources[workspace][0]["filename"] == renamed
                 assert {source["document_id"] for source in saved_sources[workspace]} == {document_id}
@@ -193,6 +270,27 @@ def main():
                 assert loaded[controls.sources_table._id]["data"] == references
                 restored = call(ui.on_select_source, "0")
                 assert date in restored[controls.source_text._id]
+
+                text_result = call(source_actions.on_text, "Pasted source.md",
+                                   f"# Project {workspace}\nReviewed launch: {date}.", "Default")
+                assert "1 indexed" in text_result[controls.source_actions.status._id]
+                text_refresh = call(ui.on_source_action_refresh, "Default")
+                text_id = next(choice[1] for choice in text_refresh[controls.review_document._id]["choices"]
+                               if choice[0] == "Pasted source.md")
+                assert set(text_refresh[controls.document_filter._id]["value"]) == {document_id, text_id}
+                text_document = services[workspace].store.get_document(text_id)
+                services[workspace].store.stage_document(text_document["path"], "Default",
+                    services[workspace].settings.fingerprint(), force=True, display_name="Pasted source.md")
+                services[workspace].store.fail_document(text_id, "Simulated failure for retry coverage")
+                call(ui.on_refresh, "Default", [document_id, text_id], document_id)
+                call(ui.on_source_selection, [text_id])
+                before_retry = calls["embeddings"]
+                retried = call(source_actions.on_retry, "Default", False)
+                assert "1 indexed" in retried[controls.source_actions.status._id], retried
+                assert calls["embeddings"] == before_retry  # Reuse the verified cached vectors.
+                call(ui.on_source_action_refresh, "Default")
+                assert services[workspace].store.get_document(text_id)["status"] == "ready"
+                call(ui.on_source_selection, [document_id])
 
             # Rendering also works for originals that have no searchable text.
             # Stage local fixtures directly so this preview check needs no OCR.
@@ -244,6 +342,10 @@ def main():
             switched = call(ui.on_workspace_selection, "Alpha")
             assert switched[controls.workspace_name._id]["value"] == "Alpha"
             assert switched[controls.workspace_name._id]["interactive"] is True
+            assert "June 1 [1]" in str(switched[controls.chatbot._id])
+            assert "July 2" not in str(switched[controls.chatbot._id])
+            assert switched[controls.workspace_details.description._id] == "Research project Alpha"
+            assert len(switched[controls.research.note_selector._id]["choices"]) == 2
             # A delayed blur from the old workspace must reach our canonical
             # selection guard, not fail in Gradio's stale choice preprocessor.
             stale_selection = call(ui.on_review_selection, workbook_document["id"])
@@ -263,9 +365,11 @@ def main():
             assert "Web-only reply" in str(web_answer[controls.chatbot._id])
             assert web_answer[controls.sources_table._id]["data"] == []
             assert calls["embeddings"] == before_web
-            assert calls["embeddings"] >= 4 and calls["answers"] == 3, calls
+            assert calls["embeddings"] >= 4 and calls["answers"] == 5, calls
             print("PASS: one-session HTTP upload/index/document review/answer/citation/save/load in two isolated workspaces")
-            print("PASS: workspace switching clears chat/upload/references; same chat names remain isolated")
+            print("PASS: completed chats autosave and restore; notes and descriptions remain workspace-scoped")
+            print("PASS: local source search, cited notes/edits, and shared Studio presets make no model calls")
+            print("PASS: pasted text indexes, failed sources retry from cache, full context avoids query embeddings, notes export")
             print("PASS: automatic workspace selection opens immediately; unchanged selection leaves chat intact")
             print("PASS: delayed file/sheet/reference selections after a workspace switch are safely ignored")
             print("PASS: original PDF page images and spreadsheet sheet switching render through RPC")

@@ -32,6 +32,22 @@ def test_round_trip_retains_citation_snapshots_and_is_separate_from_chatbot(tmp_
     assert stored["version"] == 1
 
 
+def test_full_context_provenance_survives_history_and_autosave(tmp_path):
+    from rag_chatbot import autosave
+    entries = messages(tmp_path)
+    entries[-1]["context_mode"] = "full"
+    history.save_chat(entries, "Full documents", data_dir=tmp_path)
+    assert history.load_chat("Full documents", data_dir=tmp_path) == entries
+    autosave.save(entries, autosave.new_session("Research"), data_dir=tmp_path)
+    assert autosave.latest(data_dir=tmp_path)["messages"] == entries
+
+
+@pytest.mark.parametrize("mode", [None, True, "invented", [], {}])
+def test_invalid_context_provenance_is_rejected(mode):
+    with pytest.raises(ValueError, match="context"):
+        history._validate([{"role": "assistant", "content": "Answer", "context_mode": mode}])
+
+
 def test_history_names_cannot_escape_the_chat_directory(tmp_path):
     outside = tmp_path / "outside.json"
     outside.write_text("unrelated", encoding="utf-8")

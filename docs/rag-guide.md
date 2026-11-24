@@ -29,17 +29,20 @@ with the default local configuration.
 ## Workspaces and controls
 
 Each working directory is a subfolder of `rag_chatbot/data`, containing its own
-`sources/`, `chats/`, `artifacts/` (after saving a tool result), and `library.sqlite3`. The active directory controls indexing,
+`sources/`, `chats/`, `notes/`, `artifacts/` (created as needed), and `library.sqlite3`. The active directory controls indexing,
 retrieval, chat saving/loading, and source previews. Qdrant indexes are also separated
 by working directory. Selecting a directory in **Workspace** opens it immediately.
 To create one, type a new name and press Enter; **Create / Open** remains available.
+Use **Workspace description** to record the project's purpose, then click
+**Save description**. This local description can contain up to 2,000 characters;
+it is not included in model prompts. **Reload description** restores the saved text.
 
 The RAG tab has one outer row. Its left column (one third) contains the working
 directory, Sources, and Document viewer. The right column (two thirds) contains
 two equal columns: the chatbot with Prompt controls below, and saved chat history
 with the **References from the latest answer** accordion below. The selected
 reference's download, image, and excerpt appear directly below **Open reference**
-inside that accordion. The Tools area spans the bottom of
+inside that accordion. The Research and Tools areas span the bottom of
 the right column. **Toggle chat history** shows or hides the saved-chat controls
 while keeping references available.
 
@@ -146,12 +149,14 @@ documents to populate it. Old indexed versions remain in the catalog for explici
 5. Select a document in **Document viewer** to open its preview automatically. This
    selection is independent of the checked sources used for chat retrieval.
 6. Select a reference in the history/reference column to inspect its passage and
-   original file. Save and load conversations from that directory's history controls.
+   original file. Completed replies save automatically. Use the history controls
+   to create named snapshots or load another conversation.
 
-Save a conversation before switching working directories. Opening another directory
-clears the active conversation, uploads, filters, document preview, and references, and stops work from
-the previous directory. Files and saved chats in other directories remain available
-when you open those directories again.
+Opening another directory stops work from the previous directory and resets uploads,
+source selections, and document previews. It restores the new directory's latest
+successful autosaved conversation, its references, and saved Studio results.
+Save unfinished note or description edits before switching; these editors require
+their own Save buttons.
 
 Source names are library metadata: the file on your computer and the managed original's
 stable path are unchanged. Renaming an identical reimport updates its library name
@@ -176,6 +181,116 @@ This implementation uses `langchain-text-splitters` selectively. The full `langc
 and `langchain-community` packages are unnecessary for the current readers and direct
 SDK integration. Future work can add reranking, full-page figure understanding,
 folder watching, and evaluation against a representative research library.
+
+## Pasted text and indexing retries
+
+Under **Sources → Add pasted text**, enter a source filename and paste the content,
+then click **Index pasted text**. Names accept `.txt` or `.md`; a missing extension
+becomes `.txt`. Text is limited to 1 MiB of UTF-8 and is stored as a normal managed
+original. It can be previewed, searched, cited, and selected for Studio tools.
+Indexing uses the usual embedding service and may incur charges. Saving a research
+note remains separate and does not index it automatically.
+
+To retry an interrupted or failed import, check it in Sources and click
+**Retry checked sources**. The app reuses its retained original and compatible
+extraction/embedding caches; an unchanged ready source needs no new embeddings.
+The vision checkbox applies to retries. If an original is missing or changed,
+upload the file again to repair it. **Stop indexing** stops either workflow.
+
+## Choosing chat context
+
+**Prompt → Document context** has two modes:
+
+| Mode | What the model receives |
+|---|---|
+| Relevant passages (default) | A bounded set of passages found by hybrid retrieval. Good for focused questions and large libraries. |
+| Full selected sources | Every indexed passage in the checked sources, in document order. Useful for questions spanning an entire small document or selection. |
+
+Full mode uses the local catalog without a query embedding or Qdrant connection;
+the chat generation request is still paid. It includes indexed OCR/image descriptions,
+not every original page image or content the importer could not extract. Review
+citations in either mode.
+
+Full mode accepts at most 40 documents, 512 passages, 500,000 source characters,
+and 32,000 serialized evidence tokens. The question and evidence must also fit the
+chosen model's context. Exceeding a limit fails before generation; no source text
+is silently omitted. Select fewer documents, return to Relevant passages, or use
+a Studio tool for larger whole-document work. Older conversational turns may be
+trimmed to fit. Web search remains an explicit, separate option; full mode always
+requires at least one checked indexed source.
+
+## Autosaved conversations
+
+Each successful, complete RAG reply updates an autosaved conversation in the active
+workspace. Partial streaming text, failed replies, and stopped requests do not replace
+the previous saved result. Opening a workspace, including after restarting the app,
+restores its most recently updated valid autosave. Check the response status if a
+disk error prevents saving; the completed answer remains visible.
+
+**New RAG chat** starts a separate conversation and retains earlier saves in
+**Saved RAG chats**. **Save RAG chat** writes a named snapshot; select a saved entry
+and click **Load RAG chat** to reopen it. Continuing a restored or manually loaded
+conversation creates a separate autosave on the next successful reply, so automatic
+saves do not overwrite your named snapshot. Separate browser sessions also write
+separate autosaves. Citations and whether an answer used web search are preserved.
+
+## Search and notes
+
+Open **Research — Search and Notes** above Tools.
+
+In **Search**, enter a query and click **Search checked sources**. The source
+checkboxes and collection filter define the search scope. **Keyword (local)** is
+the default: it searches the local text index without an API request or a running
+Qdrant server. **Hybrid** combines keyword and semantic search, requires the vector
+database, and sends the query to OpenAI for one embedding. Neither mode generates
+an answer. Select **Open search result** to read the matching passage and download
+its original source.
+
+In **Notes**, use **New note**, enter a title and Markdown text, then click
+**Save note**. **Saved notes** opens an existing note for editing; **Reload saved note**
+discards unsaved edits, and **Delete saved note** removes the selected note.
+**Search notes** filters titles and text locally. Two capture buttons save findings
+without another model request:
+
+- **Save latest answer to note** copies the latest completed chat answer, its source
+  references, and its web-search provenance. It is labelled **AI-derived**.
+- **Save selected search excerpt to note** copies the passage selected in Search
+  with its reference. It is labelled **Source excerpt**.
+
+Your own notes are labelled **Human**. Editing a captured note retains its origin
+and references and marks it as edited; those references may not support added text.
+Use **Note references** to review them. Notes are not automatically indexed or used
+as chat or Studio evidence, and an AI-derived note is not independent verification.
+If another browser changed a note, reload it before saving to avoid overwriting
+the newer version.
+
+To download a note, save its edits, set **Filename** and **Export format**, then
+click **Export saved note**. Markdown and JSON retain the note text, origin, edit
+status, web-search flag, and source excerpts. JSON stores workspace-relative paths
+rather than machine-specific absolute paths; the export does not bundle originals
+or import itself into another workspace. Files are written under `notes/exports/`.
+
+## Local storage and backups
+
+By default, each workspace is under `rag_chatbot/data/<workspace>/`; `RAG_DATA_DIR`
+can change the parent directory. Important contents include:
+
+| Path | Contents |
+|---|---|
+| `workspace.json` | Saved workspace description. |
+| `sources/` | Managed originals, derived images, and extraction caches. |
+| `library.sqlite3` | Document catalog and local keyword index. |
+| `chats/*.json` | Autosaved conversations and named snapshots, with citations. |
+| `notes/<id>.json` | Notes, origin, edit status, and retained references. |
+| `notes/exports/` | Downloadable Markdown and JSON notes. |
+| `artifacts/` | Current Studio results, supporting assets, and exports. |
+
+Instruction presets belong to the whole app and are stored separately in
+`.cache/studio-presets.json`; bundled plugin settings are in `.cache/plugins.json`.
+Back up these files along with the entire RAG data directory and the Qdrant Docker
+volume (or configured embedded database directory). Stop app writes while making
+a consistent backup. See [development and backups](development.md) for the rest
+of the app's storage layout.
 
 ## Troubleshooting
 

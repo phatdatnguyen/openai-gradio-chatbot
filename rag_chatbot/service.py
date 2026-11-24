@@ -51,6 +51,10 @@ class IndexingCancelled(RuntimeError):
     """Cooperative cancellation between extraction/embedding API requests."""
 
 
+class ChatCancelled(RuntimeError):
+    """A stopped or superseded chat cannot make further requests or publish."""
+
+
 class RAGService:
     def __init__(self, settings=None, *, store=None, embedder=None, streamer=None, vision=None, sender=None):
         self.settings = settings or (store.settings if store is not None else Settings())
@@ -86,13 +90,13 @@ class RAGService:
         """Let an in-flight call finish, then stop before the next paid request."""
         self._cancel_indexing.set()
 
-    def _check_cancelled(self):
-        if self._cancel_indexing.is_set():
+    def _check_cancelled(self, is_cancelled=None):
+        if self._cancel_indexing.is_set() or (is_cancelled is not None and is_cancelled()):
             raise IndexingCancelled("Indexing stopped; upload the file again to resume cached work.")
 
-    def _cached_vision(self, directory):
+    def _cached_vision(self, directory, is_cancelled=None):
         def describe(path):
-            self._check_cancelled()
+            self._check_cancelled(is_cancelled)
             digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
             key = hashlib.sha256(f"ocr-v1:{self.settings.vision_model}:{digest}".encode()).hexdigest()
             cache = directory / "vision" / f"{key}.json"
@@ -101,14 +105,18 @@ class RAGService:
                     with cache.open(encoding="utf-8") as handle:
                         cached = json.load(handle)["text"]
                     if isinstance(cached, str) and cached.strip():
+                        self._check_cancelled(is_cancelled)
                         return cached
                 except (OSError, ValueError, TypeError, KeyError):
                     logger.warning("Ignoring an unreadable vision cache: %s", cache.name)
-            self._check_cancelled()
+            self._check_cancelled(is_cancelled)
             text = self.vision(path)
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("Vision extraction returned no text or image description.")
             atomic_json(cache, {"text": text})
+            # Preserve completed paid work for retry, but never use its result
+            # to continue a stopped job.
+            self._check_cancelled(is_cancelled)
             return text
         return describe
 
@@ -135,8 +143,10 @@ class RAGService:
             logger.warning("Re-extracting an invalid chunk cache: %s", cache.name)
             return None
 
-    def ingest(self, paths, collection, use_vision=False, display_names=None):
+    def ingest(self, paths, collection, use_vision=False, display_names=None, *, is_cancelled=None):
         """Publish complete documents; retain extraction and embedding batches on retry."""
+        if is_cancelled is not None and not callable(is_cancelled):
+            raise ValueError("The indexing cancellation check must be callable.")
         if not paths:
             raise ValueError("Choose documents to index first.")
         if isinstance(paths, (str, bytes, Path)):
@@ -154,18 +164,29 @@ class RAGService:
         if not self._index_lock.acquire(blocking=False):
             raise RuntimeError("An indexing job is already running. Wait or stop it first.")
         self._cancel_indexing.clear()
+
+        def check_current():
+            self._check_cancelled(is_cancelled)
+
+        def publication_cancelled():
+            check_current()
+            return False
+
         current = None
         completed = failed = skipped = 0
         try:
             for path, display_name in zip(paths, display_names):
-                self._check_cancelled()
+                check_current()
                 current = None
                 filename = display_name or Path(path).name
                 try:
                     if Path(path).stat().st_size > 100 * 1024 * 1024:
                         raise ValueError("Files are limited to 100 MiB each.")
+                    check_current()
                     document = self.store.stage_document(path, collection, self.settings.fingerprint(),
                                                          display_name=display_name)
+                    current = document["id"] if not document["unchanged"] else None
+                    check_current()
                     filename = document["name"]
                     directory = Path(document["path"]).parent
                     profile = {"version": 2, "use_vision": bool(use_vision),
@@ -181,26 +202,31 @@ class RAGService:
                         except (OSError, ValueError):
                             pass
                     if document["unchanged"] and use_vision and published_profile != profile:
+                        check_current()
                         document = self.store.stage_document(
                             path, collection, self.settings.fingerprint(), force=True, display_name=display_name)
+                        current = document["id"] if not document["unchanged"] else None
+                    check_current()
                     if document["unchanged"]:
                         skipped += 1
                         yield f"Already indexed: {filename}"
                         continue
                     current = document["id"]
                     yield f"Preparing {filename}…"
-                    self._check_cancelled()
+                    check_current()
                     try:
                         self.store.check_connection()
                     except Exception as exc:
                         raise RuntimeError("Cannot reach Qdrant. Start Docker Desktop and run "
                                            "'docker compose up -d', or configure QDRANT_LOCAL_PATH "
                                            "for embedded storage. No embedding request was sent.") from exc
+                    check_current()
                     chunks = self._cached_chunks(cache, current)
                     if chunks is None:
+                        check_current()
                         elements = extract_elements(document["path"], vision_describe=(
-                            self._cached_vision(directory) if use_vision else None))
-                        self._check_cancelled()
+                            self._cached_vision(directory, is_cancelled) if use_vision else None))
+                        check_current()
                         chunks = chunk_elements(elements, current, self.settings.chunk_size,
                                                 self.settings.chunk_overlap)
                         if not chunks:
@@ -208,7 +234,7 @@ class RAGService:
                         atomic_json(cache, [chunk.to_dict() for chunk in chunks])
                     vectors = []
                     for offset in range(0, len(chunks), 32):
-                        self._check_cancelled()
+                        check_current()
                         batch = chunks[offset:offset + 32]
                         key = hashlib.sha256(json.dumps({
                             "fingerprint": self.settings.fingerprint(),
@@ -223,18 +249,19 @@ class RAGService:
                             except (OSError, ValueError, TypeError):
                                 logger.warning("Recomputing an invalid embedding cache: %s", batch_path.name)
                         if batch_vectors is None:
-                            self._check_cancelled()
+                            check_current()
                             batch_vectors = self._vectors([chunk.text for chunk in batch])
                             atomic_json(batch_path, batch_vectors)
                         vectors.extend(batch_vectors)
-                        self._check_cancelled()
+                        check_current()
                         yield f"Embedding {filename}: {min(offset + 32, len(chunks))}/{len(chunks)} chunks"
-                    self._check_cancelled()
+                    check_current()
                     # This marker is authoritative only while the catalog says
                     # ready. Write it before publication, so a ready document
                     # cannot retain the profile from an older extraction.
                     atomic_json(profile_path, profile)
-                    self.store.commit_document(current, chunks, vectors)
+                    check_current()
+                    self.store.commit_document(current, chunks, vectors, is_cancelled=publication_cancelled)
                     current = None
                     completed += 1
                     yield f"Indexed {filename}: {len(chunks)} chunks"
@@ -348,7 +375,25 @@ class RAGService:
         return request, sources
 
     def answer(self, question, history, collection, document_ids=None, model=None, reasoning_effort="medium", *,
-               web_search=config.WEB_SEARCH_OFF, stream_output=True, temperature=1.0, top_p=1.0):
+               web_search=config.WEB_SEARCH_OFF, stream_output=True, temperature=1.0, top_p=1.0,
+               context_mode="relevant", is_cancelled=None):
+        from . import chat_context
+
+        if not isinstance(context_mode, str) or context_mode not in chat_context.CONTEXT_MODES:
+            raise ValueError("Choose Relevant passages or Full selected sources for chat context.")
+        if is_cancelled is not None and not callable(is_cancelled):
+            raise ValueError("The chat cancellation check must be callable.")
+        snapshot = None
+
+        def check_current():
+            if is_cancelled is not None and is_cancelled():
+                raise ChatCancelled("The chat was stopped or superseded.")
+            if snapshot is not None:
+                self.store.validate_source_snapshot(snapshot["documents"])
+                if is_cancelled is not None and is_cancelled():
+                    raise ChatCancelled("The chat was stopped or superseded.")
+
+        check_current()
         model = model or config.DEFAULT_MODEL
         question = (question or "").strip()
         if not question:
@@ -362,25 +407,39 @@ class RAGService:
         if type(stream_output) is not bool:
             raise ValueError("Stream output must be enabled or disabled.")
         history = list(history or [])
-        ready = [document for document in self.store.list_documents(collection)
-                 if document["status"] == "ready"
-                 and document.get("generation")
-                 and document["fingerprint"] == self.settings.fingerprint()
-                 and (document_ids is None or document["id"] in document_ids)]
-        evidence = []
-        if ready:
-            self.store.check_connection()
-            query = self._query(question, history)
-            vector = self._vectors([query])[0]
-            evidence = self.store.search(query, vector, collection, document_ids=document_ids,
-                                         limit=self.settings.evidence_count,
-                                         candidates=self.settings.candidate_count)
+        if context_mode == "full":
+            snapshot = chat_context.snapshot_sources(self.store, document_ids, collection)
+            check_current()
+            context_history = self._scoped_history(history, {item["id"] for item in snapshot["documents"]})
+            request, sources = chat_context.prepare_request(
+                question, context_history, snapshot, model, web_search=web_search,
+                system_prompt=WEB_SYSTEM_PROMPT if use_search else SYSTEM_PROMPT)
+        else:
+            ready = [document for document in self.store.list_documents(collection)
+                     if document["status"] == "ready"
+                     and document.get("generation")
+                     and document["fingerprint"] == self.settings.fingerprint()
+                     and (document_ids is None or document["id"] in document_ids)]
+            evidence = []
+            check_current()
+            if ready:
+                self.store.check_connection()
+                check_current()
+                query = self._query(question, history)
+                check_current()
+                vector = self._vectors([query])[0]
+                check_current()
+                evidence = self.store.search(query, vector, collection, document_ids=document_ids,
+                                             limit=self.settings.evidence_count,
+                                             candidates=self.settings.candidate_count)
+                check_current()
+            if evidence or use_search:
+                context_history = self._scoped_history(history, {document["id"] for document in ready})
+                request, sources = self._request(question, context_history, evidence, model, web_search=web_search)
+            else:
+                request, sources = None, []
+        check_current()
         updated = history + [{"role": "user", "content": question}]
-        if not evidence and not use_search:
-            yield updated + [{"role": "assistant", "content": NO_EVIDENCE, "sources": []}], []
-            return
-        context_history = self._scoped_history(history, {document["id"] for document in ready})
-        request, sources = self._request(question, context_history, evidence, model, web_search=web_search)
         if request is None:
             yield updated + [{"role": "assistant", "content": NO_EVIDENCE, "sources": []}], []
             return
@@ -392,6 +451,8 @@ class RAGService:
             message = {"role": "assistant", "content": text, "sources": sources}
             if use_search:
                 message["web_search"] = True
+            if context_mode == "full":
+                message["context_mode"] = "full"
             return message
 
         text = ""
@@ -401,11 +462,15 @@ class RAGService:
             # Existing injected streamers keep their document-only call shape.
             if use_search:
                 options["final_text_callback"] = final_text.append
+            check_current()
             stream = self.streamer(model, request, **options)
             try:
+                check_current()
                 for delta in stream:
+                    check_current()
                     text += delta
                     yield updated + [assistant(text)], sources
+                    check_current()
             finally:
                 close = getattr(stream, "close", None)
                 if close:
@@ -413,7 +478,9 @@ class RAGService:
             if final_text:
                 text = final_text[-1]
         else:
+            check_current()
             text = self.sender(model, request, **options)
+        check_current()
         if not text.strip():
             raise RuntimeError("The model returned an empty answer.")
         valid = {source["number"] for source in sources}
@@ -426,6 +493,7 @@ class RAGService:
         if valid and not cited.intersection(valid):
             text += ("\n\nNo local-document citations were included in this answer; web links refer to external sources."
                      if use_search else "\n\nNo source citations were included in this answer; check the retrieved passages below.")
+        check_current()
         yield updated + [assistant(text)], sources
 
 

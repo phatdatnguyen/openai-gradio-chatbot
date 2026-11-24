@@ -3,6 +3,7 @@
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import gradio as gr
 from gradio.context import get_blocks_context
@@ -34,6 +35,21 @@ def _workspaces():
 def _history_store():
     from . import history
     return history
+
+
+def _autosave_store():
+    from . import autosave
+    return autosave
+
+
+def _new_chat_session(workspace, operation_state):
+    if operation_state is not None:
+        operation_state["autosave"] = _autosave_store().new_session(workspace)
+
+
+def _chat_choices(names):
+    return [(_autosave_store().display_name(name), name) if name.startswith("Autosaved ") else name
+            for name in names]
 
 
 def _display(history):
@@ -267,16 +283,25 @@ def on_open_workspace(name, current_workspace, current_history=None, pending=Non
         selection = {"viewer_revision": operation_state.get("viewer_revision", 0)} if operation_state is not None else {}
         library = _library_updates(canonical, operation_state=selection, reset=True)
         saved = _history_store().list_chats(data_dir=service.settings.data_dir)
+        restored = _autosave_store().latest(data_dir=service.settings.data_dir)
+        restored_history = restored["messages"] if restored else []
+        restored_sources = next((entry.get("sources", []) for entry in reversed(restored_history)
+                                 if entry["role"] == "assistant"), [])
         review = _review_updates(canonical, operation_state=selection, reset=True)
         choices = _workspaces().list_workspaces()
         if not current():
             return (gr.skip(),) * (24 + REVIEW_OUTPUT_COUNT + UPLOAD_OUTPUT_COUNT)
         if operation_state is not None:
             operation_state.update(selection)
+            # Restored content starts a private continuation. Two browser
+            # sessions must never overwrite the same autosave accidentally.
+            _new_chat_session(canonical, operation_state)
         return (canonical, gr.update(choices=choices, value=canonical),
                 f"Workspace: {canonical}", *library, "Library refreshed.",
-                gr.update(choices=saved, value=None), None, DEFAULT_COLLECTION, "", "RAG chat", "",
-                *_answer_update([], [], question=""),
+                gr.update(choices=_chat_choices(saved), value=restored["name"] if restored else None),
+                None, DEFAULT_COLLECTION, "", "RAG chat", "",
+                *_answer_update(restored_history, restored_sources, question="",
+                                status="Restored the latest autosaved conversation." if restored else ""),
                 *review,
                 {}, gr.update(value="", interactive=False), gr.update(choices=[], value=None, visible=False), "")
     except Exception as exc:
@@ -299,6 +324,48 @@ def _current_operation(operation_state, revision):
             and not operation_state.get("switching", False))
 
 
+def _chat_epoch_matches(operation_state, workspace_epoch):
+    # Queued primitive inputs belong to the workspace visible at click time;
+    # Gradio resolves State only when the callback starts executing.
+    return (workspace_epoch is None or isinstance(workspace_epoch, str) and bool(workspace_epoch)
+            and operation_state is not None
+            and workspace_epoch == operation_state.get("chat_workspace_epoch"))
+
+
+def workspace_extra_count():
+    from . import research_ui, workspace_ui, source_actions
+    from .tools import presets_ui
+    return (research_ui.OUTPUT_COUNT + workspace_ui.OUTPUT_COUNT + presets_ui.RESET_OUTPUT_COUNT
+            + source_actions.OUTPUT_COUNT + 1)
+
+
+def on_workspace_extras(workspace, operation_state):
+    """Reset research editors and preset selections before enabling a new workspace."""
+    from . import research_ui, workspace_ui, source_actions
+    from .tools import presets_ui
+    revision = operation_state.get("revision", 0)
+    outputs = []
+    for reset in (research_ui.on_reset, workspace_ui.on_reset, presets_ui.reset_all, source_actions.on_reset):
+        if operation_state.get("revision", 0) != revision:
+            return (gr.skip(),) * workspace_extra_count()
+        outputs.extend(reset(workspace, operation_state))
+    if operation_state.get("revision", 0) != revision:
+        return (gr.skip(),) * workspace_extra_count()
+    operation_state["chat_workspace_epoch"] = uuid4().hex
+    outputs.append(operation_state["chat_workspace_epoch"])
+    return tuple(outputs)
+
+
+def on_source_action_refresh(workspace, collection, operation_state, action_state, workspace_epoch):
+    from .source_actions import can_refresh
+    if not can_refresh(action_state, workspace, operation_state, workspace_epoch):
+        return (gr.skip(),) * (4 + REVIEW_OUTPUT_COUNT)
+    outputs = on_refresh(workspace, collection, operation_state=operation_state)
+    if not can_refresh(action_state, workspace, operation_state, workspace_epoch):
+        return (gr.skip(),) * (4 + REVIEW_OUTPUT_COUNT)
+    return outputs
+
+
 def on_workspace_selection(name, current_workspace, current_history, pending, operation_state):
     """Open a changed selection, ignoring Dropdown's unchanged blur events.
 
@@ -307,13 +374,14 @@ def on_workspace_selection(name, current_workspace, current_history, pending, op
     Keep opening and tool restoration in this job so duplicate input events see
     the newly committed workspace before deciding whether to switch again.
     """
-    from .tools.ui import TOTAL_OUTPUT_COUNT, on_workspace_reset
+    from .tools.ui import TOTAL_OUTPUT_COUNT, on_workspace_reset, rebind_retained_workspace
 
     workspace_count = 24 + REVIEW_OUTPUT_COUNT + UPLOAD_OUTPUT_COUNT
-    output_count = workspace_count + TOTAL_OUTPUT_COUNT + 2
+    output_count = workspace_count + TOTAL_OUTPUT_COUNT + workspace_extra_count() + 2
     if not name or name.strip().casefold() == (current_workspace or "").strip().casefold():
         yield (gr.skip(),) * output_count
         return
+    previous_revision = operation_state["revision"]
     prepared = on_prepare_workspace_switch(current_workspace, operation_state)
     revision = operation_state["revision"]
     preparing = [gr.skip()] * output_count
@@ -331,10 +399,20 @@ def on_workspace_selection(name, current_workspace, current_history, pending, op
                     else (gr.skip(),) * TOTAL_OUTPUT_COUNT)
     if operation_state["revision"] != committed_revision:
         return
+    # A failed open still advances the operation revision. Renew the retained
+    # workspace's editor tokens so its Save/Reload controls remain usable.
+    research_workspace = opened[0] if isinstance(opened[0], str) else current_workspace
+    extra_outputs = (on_workspace_extras(research_workspace, operation_state) if research_workspace
+                     else (gr.skip(),) * workspace_extra_count())
+    if operation_state["revision"] != committed_revision:
+        return
+    if not isinstance(opened[0], str) and current_workspace:
+        rebind_retained_workspace(current_workspace, operation_state, previous_revision,
+                                  committed_revision + 1)
     # Commit the new active State before allowing new answer/tool requests.
     # Gradio applies each yield before requesting the generator's next item.
     opened[1] = {**opened[1], "interactive": False}
-    yield (*opened, *tool_outputs, operation_state, gr.update(interactive=False))
+    yield (*opened, *tool_outputs, *extra_outputs, operation_state, gr.update(interactive=False))
     if operation_state["revision"] != committed_revision:
         return
     finished, button, dropdown = on_finish_workspace_switch(operation_state)
@@ -449,26 +527,41 @@ def _answer_update(history, sources, question=None, status="", display=None, pen
 
 
 def on_answer(question, history, collection, selected_ids, model, reasoning_effort, workspace, operation_state,
-              web_search=model_config.WEB_SEARCH_OFF, stream_output=True, temperature=1.0, top_p=1.0):
+              web_search=model_config.WEB_SEARCH_OFF, stream_output=True, temperature=1.0, top_p=1.0,
+              context_mode="relevant", workspace_epoch=None):
+    if not _chat_epoch_matches(operation_state, workspace_epoch):
+        yield (gr.skip(),) * 11
+        return
     revision = operation_state["revision"]
     answer_revision = operation_state.get("answer_revision", 0)
+    session = operation_state.get("autosave")
 
     def still_current():
         return (_current_operation(operation_state, revision)
-                and operation_state.get("answer_revision", 0) == answer_revision)
+                and operation_state.get("answer_revision", 0) == answer_revision
+                and operation_state.get("autosave") is session)
 
     if operation_state.get("switching", False):
         yield (gr.skip(),) * 6 + ("Wait for the workspace to open before sending a question.",) + (gr.skip(),) * 4
         return
     question = (question or "").strip()
     previous = list(history or [])
+    if context_mode not in ("relevant", "full"):
+        yield (gr.skip(),) * 6 + ("Choose Relevant passages or Full selected sources.",) + (gr.skip(),) * 4
+        return
     if not question:
         yield (gr.skip(),) * 6 + ("Enter a question about your documents.",) + (gr.skip(),) * 4
         return
     use_search = bool(web_search) and web_search != model_config.WEB_SEARCH_OFF
-    if not selected_ids and not use_search:
+    if not selected_ids and (not use_search or context_mode == "full"):
         yield (gr.skip(),) * 6 + ("No sources selected. Check at least one ready source before sending a question.",) + (gr.skip(),) * 4
         return
+    if session is not None and session.get("workspace") != workspace:
+        yield (gr.skip(),) * 11
+        return
+    if session is None:
+        _new_chat_session(workspace, operation_state)
+        session = operation_state["autosave"]
     pending_turn = {"history": previous, "question": question, "workspace": workspace}
     pending = _display(previous) + [{"role": "user", "content": question}]
     yield _answer_update(previous, [], question="", status=("Searching documents and the web…" if use_search
@@ -479,10 +572,16 @@ def on_answer(question, history, collection, selected_ids, model, reasoning_effo
             return
         latest = None
         service = get_service(workspace)
+        context_options = {"context_mode": context_mode} if context_mode != "relevant" else {}
+        # UI jobs always carry a cancellation predicate. Direct callers retain
+        # the original default injection contract used by offline integrations.
+        if workspace_epoch is not None or context_mode == "full":
+            context_options["is_cancelled"] = lambda: not still_current()
         with closing(service.answer(
             question, previous, collection, document_ids=list(selected_ids or []),
             model=model, reasoning_effort=reasoning_effort,
             web_search=web_search, stream_output=stream_output, temperature=temperature, top_p=top_p,
+            **context_options,
         )) as replies:
             for updated, sources in replies:
                 if not still_current():
@@ -493,7 +592,19 @@ def on_answer(question, history, collection, selected_ids, model, reasoning_effo
             return
         if latest is None:
             raise RuntimeError("No answer was returned. Please try again.")
-        yield _answer_update(*latest)
+        save_status = ""
+        try:
+            _autosave_store().save(latest[0], session, data_dir=service.settings.data_dir,
+                                   is_cancelled=lambda: not still_current())
+            session["saved"] = True
+            save_status = "Conversation autosaved."
+        except (OSError, ValueError, TypeError, RuntimeError, UnicodeError, RecursionError) as exc:
+            logger.exception("Autosaving a completed RAG answer failed")
+            if not still_current():
+                return
+            save_status = f"Answer completed, but autosave failed: {exc}. Use Save chat to keep it."
+        if still_current():
+            yield _answer_update(*latest, status=save_status)
     except Exception as exc:
         logger.exception("RAG answer failed")
         if not still_current():
@@ -503,11 +614,22 @@ def on_answer(question, history, collection, selected_ids, model, reasoning_effo
         yield _answer_update(previous, [], status=f"Request failed: {exc}", display=pending)
 
 
-def on_new_chat():
+def on_new_chat(workspace=None, operation_state=None, workspace_epoch=None):
+    if not _chat_epoch_matches(operation_state, workspace_epoch):
+        return (gr.skip(),) * 11
+    if operation_state is not None:
+        if operation_state.get("switching", False):
+            return (gr.skip(),) * 11
+        operation_state["answer_revision"] = operation_state.get("answer_revision", 0) + 1
+        _new_chat_session(workspace, operation_state)
     return _answer_update([], [])
 
 
-def on_stop_chat(history, pending):
+def on_stop_chat(history, pending, operation_state=None, workspace_epoch=None):
+    if not _chat_epoch_matches(operation_state, workspace_epoch):
+        return (gr.skip(),) * 11
+    if operation_state is not None:
+        operation_state["answer_revision"] = operation_state.get("answer_revision", 0) + 1
     if pending is None:
         return (gr.skip(),) * 6 + ("No answer is running.",) + (gr.skip(),) * 4
     previous = pending["history"]
@@ -646,27 +768,49 @@ def on_preview_sheet(document_id, sheet, workspace, operation_state):
     return on_preview_document(document_id, 1, sheet, workspace, operation_state)
 
 
-def on_save_chat(history, name, workspace):
+def on_save_chat(history, name, workspace, operation_state=None, workspace_epoch=None):
+    if (not _chat_epoch_matches(operation_state, workspace_epoch)
+            or operation_state is not None and operation_state.get("switching")):
+        return gr.skip(), gr.skip()
     try:
         store = _history_store()
         data_dir = get_service(workspace).settings.data_dir
         saved = store.save_chat(history, name, data_dir=data_dir)
-        return f"Saved {saved}.", gr.update(choices=store.list_chats(data_dir=data_dir), value=saved)
+        return f"Saved {saved}.", gr.update(choices=_chat_choices(store.list_chats(data_dir=data_dir)), value=saved)
     except Exception as exc:
         logger.exception("Saving RAG chat failed")
         return f"Could not save chat: {exc}", gr.skip()
 
 
-def on_load_chat(name, current_history, pending, workspace):
+def on_load_chat(name, current_history, pending, workspace, operation_state=None, workspace_epoch=None):
+    if not _chat_epoch_matches(operation_state, workspace_epoch):
+        return (gr.skip(),) * 11
+    revision = operation_state.get("revision", 0) if operation_state is not None else None
+    answer_revision = operation_state.get("answer_revision", 0) if operation_state is not None else None
+
+    def current():
+        return operation_state is None or (_current_operation(operation_state, revision)
+            and operation_state.get("answer_revision", 0) == answer_revision)
+
+    if not current():
+        return (gr.skip(),) * 11
+    if operation_state is not None:
+        operation_state["answer_revision"] = operation_state.get("answer_revision", 0) + 1
+        answer_revision = operation_state["answer_revision"]
     try:
         if not name:
             raise ValueError("Select a saved chat first.")
         history = _history_store().load_chat(name, data_dir=get_service(workspace).settings.data_dir)
+        if not current():
+            return (gr.skip(),) * 11
+        _new_chat_session(workspace, operation_state)
         sources = next((entry.get("sources", []) for entry in reversed(history)
                         if entry.get("role") == "assistant"), [])
         return _answer_update(history, sources, status=f"Loaded {name}.")
     except Exception as exc:
         logger.exception("Loading RAG chat failed")
+        if not current():
+            return (gr.skip(),) * 11
         if pending is not None:
             # Loading also cancels generation. If the file cannot be opened,
             # remove that canceled partial turn instead of leaving it pending.
@@ -674,6 +818,24 @@ def on_load_chat(name, current_history, pending, workspace):
             stopped[6] = f"Could not load chat: {exc}"
             return tuple(stopped)
         return (gr.skip(),) * 6 + (f"Could not load chat: {exc}",) + (gr.skip(),) * 4
+
+
+def on_refresh_saved_chats(workspace, operation_state):
+    """Refresh choices after a completed send without replaying dynamic inputs."""
+    revision = operation_state.get("revision", 0)
+    session = operation_state.get("autosave")
+    if (not session or session.get("workspace") != workspace
+            or not _current_operation(operation_state, revision)):
+        return gr.skip()
+    try:
+        choices = _history_store().list_chats(data_dir=get_service(workspace).settings.data_dir)
+        if not _current_operation(operation_state, revision) or operation_state.get("autosave") is not session:
+            return gr.skip()
+        selected = session["name"] if session.get("saved") and session["name"] in choices else None
+        return gr.update(choices=_chat_choices(choices), value=selected)
+    except (OSError, ValueError) as exc:
+        logger.warning("Refreshing autosaved chat choices failed: %s", exc)
+        return gr.skip()
 
 
 def on_toggle_history(visible):
@@ -691,6 +853,7 @@ def build_tab():
     upload_names_state = gr.State({})
     workspace_state = gr.State(None)
     operation_state = gr.State({"revision": 0, "switching": False, "viewer_revision": 0})
+    chat_workspace_epoch = gr.Textbox(value="", visible=False, elem_id="rag-chat-workspace-epoch")
     history_column_state = gr.State(True)
 
     with gr.Row() as outer_row:
@@ -699,6 +862,8 @@ def build_tab():
                                          info="Selecting a workspace opens it. Type a new name and press Enter to create it.")
             workspace_button = gr.Button("Create / Open workspace", variant="primary")
             workspace_status = gr.Markdown("Opening workspace...")
+            from .workspace_ui import build as build_workspace_details
+            workspace_details = build_workspace_details(workspace_state, operation_state)
             with gr.Accordion("Sources", open=True):
                 upload = gr.File(label="Upload documents", file_count="multiple", type="filepath")
                 upload_filename = gr.Textbox(label="Filename", interactive=False,
@@ -726,6 +891,9 @@ def build_tab():
                 library_table = gr.Dataframe(headers=LIBRARY_COLUMNS, value=[], interactive=False,
                                              max_height=260, wrap=True)
                 library_status = gr.Markdown()
+                from .source_actions import build as build_source_actions
+                source_actions = build_source_actions(workspace_state, collection_filter, use_vision,
+                                                      operation_state, get_service=get_service)
                 gr.Markdown("Indexing sends extracted text to OpenAI for embeddings. Questions send "
                             "matching passages. Optional vision also sends document images.")
             with gr.Accordion("Document viewer", open=True) as viewer_group:
@@ -773,6 +941,10 @@ def build_tab():
                             choices=model_config.WEB_SEARCH_CONTEXT_CHOICES,
                             interactive=model_config.supports_web_search(model_config.DEFAULT_MODEL),
                             info="Optional web evidence supplements the selected documents; web links appear in the answer.")
+                        context_mode = gr.Dropdown(label="Document context",
+                            choices=[("Relevant passages", "relevant"), ("Full selected sources", "full")],
+                            value="relevant", info="Full mode sends every indexed passage in the checked sources. "
+                            "Selections over 32,000 evidence tokens are rejected; use fewer sources or a Studio tool.")
                         stream_output = gr.Checkbox(label="Stream responses", value=True,
                             interactive=model_config.supports_streaming(model_config.DEFAULT_MODEL))
                         _sampling = model_config.supports_temperature(model_config.DEFAULT_MODEL, reasoning_effort.value)
@@ -800,12 +972,19 @@ def build_tab():
                         source_text = gr.Textbox(label="Source excerpt", lines=6, max_lines=6, interactive=False)
             with gr.Row() as bottom_row:
                 with gr.Column(scale=1) as tools_column:
+                    with gr.Accordion("Research — Search and Notes", open=False):
+                        from .research_ui import build as build_research
+                        research = build_research(workspace_state, collection_filter, document_filter,
+                                                  history_state, sources_state, operation_state,
+                                                  pending_state=pending_state)
                     with gr.Accordion("Tools", open=True):
                         from .tools.ui import (build_tools, on_reset as reset_tools,
                                                on_workspace_reset, on_selection_changed)
                         tools = build_tools(workspace_state, document_filter, collection_filter,
                                             model, reasoning_effort, operation_state)
 
+    workspace_extra_outputs = [*research.outputs, *workspace_details.outputs, *tools.preset_outputs,
+                               *source_actions.outputs, chat_workspace_epoch]
     answer_outputs = [history_state, chatbot, sources_state, sources_table, source_selector,
                       question, status, original_file, source_image, source_text, pending_state]
     viewer_outputs = [viewer_state, viewer_original, viewer_image, viewer_html, viewer_table,
@@ -844,8 +1023,10 @@ def build_tab():
     send_event = gr.on(triggers=[question.submit, send_button.click], fn=on_answer,
                       inputs=[question, history_state, collection_filter, document_filter,
                               model, reasoning_effort, workspace_state, operation_state,
-                              web_search, stream_output, temperature, top_p],
+                              web_search, stream_output, temperature, top_p, context_mode, chat_workspace_epoch],
                       outputs=answer_outputs, trigger_mode="once", concurrency_limit=1)
+    saved_refresh_event = send_event.then(on_refresh_saved_chats, [workspace_state, operation_state],
+                                           saved_chat, **_storage_queue)
     document_filter.input(on_source_selection,
         [document_filter, operation_state, history_state, pending_state], answer_outputs,
         queue=False, cancels=[send_event], trigger_mode="always_last")
@@ -858,8 +1039,10 @@ def build_tab():
     select_all_sources_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
     clear_sources_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
     delete_button.click(on_selection_changed, operation_state, tools.statuses, queue=False)
-    stop_button.click(on_stop_chat, [history_state, pending_state], answer_outputs, cancels=[send_event])
-    new_chat_button.click(on_new_chat, outputs=answer_outputs, cancels=[send_event])
+    stop_button.click(on_stop_chat, [history_state, pending_state, operation_state, chat_workspace_epoch], answer_outputs,
+                      cancels=[send_event], queue=False)
+    new_chat_button.click(on_new_chat, [workspace_state, operation_state, chat_workspace_epoch],
+                          outputs=answer_outputs, cancels=[send_event], queue=False)
     toggle_history_column_button.click(on_toggle_history, history_column_state,
                                        [history_column, history_column_state])
     model.change(on_model_change, model, reasoning_effort)
@@ -881,34 +1064,41 @@ def build_tab():
                                               upload_filename, upload_names_state, upload_editor_path],
                                     [index_status, library_table, collection_filter, document_filter, *review_outputs])
     index_stop_button.click(on_stop_index, workspace_state, index_status,
-                            cancels=[index_event], queue=False)
+                            cancels=[index_event, *source_actions.index_events], queue=False)
+    source_refresh_events = [event.then(on_source_action_refresh,
+        [workspace_state, collection_filter, operation_state, source_actions.state, source_actions.workspace_epoch],
+        library_outputs, **_storage_queue) for event in source_actions.index_events]
     delete_button.click(on_delete_documents, [document_filter, collection_filter, workspace_state,
                                              review_document, operation_state], library_outputs, preprocess=False, **_storage_queue)
     source_selector.input(on_select_source, [source_selector, sources_state, workspace_state],
                           [original_file, source_image, source_text], preprocess=False, **_storage_queue)
-    save_button.click(on_save_chat, [history_state, chat_name, workspace_state],
+    save_button.click(on_save_chat, [history_state, chat_name, workspace_state, operation_state, chat_workspace_epoch],
                       [save_status, saved_chat], **_storage_queue)
-    load_button.click(on_load_chat, [saved_chat, history_state, pending_state, workspace_state],
+    load_button.click(on_load_chat, [saved_chat, history_state, pending_state, workspace_state, operation_state, chat_workspace_epoch],
                       answer_outputs, cancels=[send_event], preprocess=False, **_storage_queue)
     # Unlike change, input ignores programmatic values, but Gradio also emits
     # input on unchanged blur. Guard that before invalidating any session work.
     workspace_selection_event = workspace_name.input(on_workspace_selection,
         [workspace_name, workspace_state, history_state, pending_state, operation_state],
-        [*workspace_outputs, *tools.outputs, operation_state, workspace_button],
+        [*workspace_outputs, *tools.outputs, *workspace_extra_outputs, operation_state, workspace_button],
         trigger_mode="always_last", **_storage_queue)
     workspace_cancel_event = workspace_button.click(on_prepare_workspace_switch,
         [workspace_state, operation_state], [operation_state, workspace_status, workspace_button, workspace_name],
-        cancels=[send_event, index_event, *viewer_events], queue=False)
+        cancels=[send_event, index_event, *source_actions.index_events, *viewer_events], queue=False)
     workspace_open_event = workspace_cancel_event.then(on_open_workspace,
         [workspace_name, workspace_state, history_state, pending_state, operation_state],
         workspace_outputs, **_storage_queue)
     workspace_tools_event = workspace_open_event.then(on_workspace_reset, [workspace_state, operation_state],
                                                        tools.outputs, **_storage_queue)
-    workspace_ready_event = workspace_tools_event.then(on_finish_workspace_switch, operation_state,
+    workspace_research_event = workspace_tools_event.then(on_workspace_extras, [workspace_state, operation_state],
+                                                         workspace_extra_outputs, **_storage_queue)
+    workspace_ready_event = workspace_research_event.then(on_finish_workspace_switch, operation_state,
         [operation_state, workspace_button, workspace_name], queue=False)
     load_event = get_blocks_context().root_block.load(on_initial_load, inputs=[operation_state],
                                                      outputs=workspace_outputs, **_storage_queue)
     tools_load_event = load_event.then(reset_tools, [workspace_state, operation_state],
                                       tools.outputs, **_storage_queue)
+    research_load_event = tools_load_event.then(on_workspace_extras, [workspace_state, operation_state],
+                                               workspace_extra_outputs, **_storage_queue)
     return SimpleNamespace(**{name: value for name, value in locals().items()
                               if not name.startswith("_")})
